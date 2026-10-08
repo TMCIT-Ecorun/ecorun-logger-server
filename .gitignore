@@ -1,0 +1,29 @@
+# Rust
+/target/
+
+# Node / Svelte
+node_modules/
+web/build/
+web/.svelte-kit/
+
+# Local environment / secrets
+.env
+.env.*
+!.env.example
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Logs / runtime data
+*.log
+run/
+data/
+
+# Local agent state
+.codex/
+.agents/
+.aws/
+
+.gitdata/

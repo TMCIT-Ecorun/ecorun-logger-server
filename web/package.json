@@ -1,0 +1,15 @@
+{
+  "name": "ecorun-logger-web",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": { "dev": "vite dev", "build": "vite build", "preview": "vite preview" },
+  "packageManager": "pnpm@10.0.0",
+  "devDependencies": {
+    "@sveltejs/adapter-static": "^3.0.8",
+    "@sveltejs/kit": "^2.48.0",
+    "@sveltejs/vite-plugin-svelte": "^6.2.0",
+    "svelte": "^5.38.7",
+    "vite": "^7.1.7"
+  }
+}
