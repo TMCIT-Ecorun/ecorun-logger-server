@@ -22,7 +22,8 @@ use audio::{AudioCodec, OpusCodec};
 use room::{RoomManager, SessionId};
 
 const DEFAULT_BIND: &str = "0.0.0.0:3000";
-const AUDIO_QUEUE_CAPACITY: usize = 8;
+// At 60 ms per packet this bounds queued audio to 180 ms per receiver.
+const AUDIO_QUEUE_CAPACITY: usize = 3;
 const CONTROL_QUEUE_CAPACITY: usize = 32;
 
 #[derive(Clone)]
@@ -88,6 +89,9 @@ async fn main() -> anyhow::Result<()> {
         .route("/", get(web_index))
         .route("/manifest.webmanifest", get(web_manifest))
         .route("/icon.svg", get(web_icon))
+        .route("/icon-192.png", get(web_icon_192))
+        .route("/icon-512.png", get(web_icon_512))
+        .route("/service-worker.js", get(web_service_worker))
         .route("/_app/{*path}", get(web_asset))
         .with_state(state);
 
@@ -139,6 +143,15 @@ async fn web_manifest() -> Response {
 }
 async fn web_icon() -> Response {
     serve_web_file("web/build/icon.svg", "image/svg+xml").await
+}
+async fn web_icon_192() -> Response {
+    serve_web_file("web/build/icon-192.png", "image/png").await
+}
+async fn web_icon_512() -> Response {
+    serve_web_file("web/build/icon-512.png", "image/png").await
+}
+async fn web_service_worker() -> Response {
+    serve_web_file("web/build/service-worker.js", "text/javascript; charset=utf-8").await
 }
 
 async fn web_asset(Path(path): Path<String>) -> Response {
@@ -201,6 +214,7 @@ async fn handle_audio_socket(mut socket: WebSocket, state: AppState, initial_roo
             return;
         }
     };
+    let mut pending_pcm: Vec<i16> = Vec::with_capacity(audio::FRAME_SAMPLES * 2);
 
     let hello = serde_json::to_string(&ServerEvent::Hello {
         protocol: 2,
@@ -234,7 +248,7 @@ async fn handle_audio_socket(mut socket: WebSocket, state: AppState, initial_roo
         participants,
     })
     .unwrap();
-    let _ = control_tx.try_send(state_event);
+    state.rooms.broadcast_control(&initial_room_id, state_event).await;
 
     loop {
         tokio::select! {
@@ -253,9 +267,13 @@ async fn handle_audio_socket(mut socket: WebSocket, state: AppState, initial_roo
                         match codec.decode_and_validate(&packet) {
                             Ok(pcm) => {
                                 if let Some(room) = room_id.as_deref() {
-                                    match codec.encode(&pcm) {
-                                        Ok(encoded) => state.rooms.broadcast_audio(room, session_id, encoded).await,
-                                        Err(error) => warn!(%session_id, %error, "audio encode failed"),
+                                    pending_pcm.extend_from_slice(&pcm);
+                                    while pending_pcm.len() >= audio::FRAME_SAMPLES {
+                                        let frame: Vec<i16> = pending_pcm.drain(..audio::FRAME_SAMPLES).collect();
+                                        match codec.encode(&frame) {
+                                            Ok(encoded) => state.rooms.broadcast_audio(room, session_id, encoded).await,
+                                            Err(error) => warn!(%session_id, %error, "audio encode failed"),
+                                        }
                                     }
                                 }
                             }
@@ -294,6 +312,12 @@ async fn handle_audio_socket(mut socket: WebSocket, state: AppState, initial_roo
                         Ok(ControlEvent::RoomLeave) => {
                             if let Some(previous) = room_id.take() {
                                 state.rooms.leave(&previous, session_id).await;
+                                let participants = state.rooms.participant_states(&previous).await;
+                                let state_event = serde_json::to_string(&ServerEvent::RoomState {
+                                    room_id: &previous,
+                                    participants,
+                                }).unwrap();
+                                state.rooms.broadcast_control(&previous, state_event).await;
                             }
                         }
                         Ok(ControlEvent::AudioMute { muted }) => {

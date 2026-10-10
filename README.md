@@ -107,6 +107,22 @@ cargo run --bin phase1_test_client -- ws://192.168.1.10:3000/ws/audio/main
 
 hello/config、room.join、8 kHz mono / 60 ms Opus、room内fan-outをまとめて確認できます。
 
+### 音声再生の診断用テスト音源
+
+ブラウザの受信・デコード・再生経路を確認するには、別ターミナルで合成した440 Hzのトーンを送信します（マイク不要）。このテストクライアントは実際の音声経路と同じ8 kHz mono / 60 ms Opusパケットを送ります。MP3ファイルをそのままWebSocketに送ることはできません。サーバーの音声プロトコルはOpusパケットを要求します。
+
+```bash
+cargo run --bin audio_test_client
+```
+
+引数は `WebSocket URL`、`room ID`、`再生秒数` の順で、省略時は `ws://127.0.0.1:3000/ws/audio/main`、`main`、30秒です。例えば:
+
+```bash
+cargo run --bin audio_test_client -- ws://127.0.0.1:3000/ws/audio/main main 60
+```
+
+ブラウザも同じroom（`main`）に接続して受信ログと音を確認してください。
+
 ## 設定
 
 `.env.example` を参照してください。主な環境変数は以下です。

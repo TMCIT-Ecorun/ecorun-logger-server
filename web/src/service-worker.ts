@@ -1,8 +1,8 @@
 /// <reference lib="webworker" />
 
 const worker = self as unknown as ServiceWorkerGlobalScope;
-const CACHE = 'ecorun-shell-v1';
-const SHELL = ['/', '/manifest.webmanifest', '/icon.svg'];
+const CACHE = 'ecorun-shell-v2';
+const SHELL = ['/', '/manifest.webmanifest', '/icon.svg', '/icon-192.png', '/icon-512.png'];
 
 worker.addEventListener('install', (event) => {
   event.waitUntil(caches.open(CACHE).then((cache) => cache.addAll(SHELL)));

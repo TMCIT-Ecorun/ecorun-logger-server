@@ -57,11 +57,12 @@ impl AudioCodec for OpusCodec {
         if packet.len() > MAX_PACKET_SIZE {
             return Err(AudioError::PacketTooLarge(packet.len()));
         }
-        let mut pcm = vec![0_i16; FRAME_SAMPLES];
+        // WebCodecs may emit 20 ms Opus packets even when the input AudioData
+        // is supplied in 60 ms blocks. Opus packets can also contain longer
+        // frames, so decode into the codec's maximum 120 ms buffer.
+        let mut pcm = vec![0_i16; SAMPLE_RATE as usize * 120 / 1000];
         let samples = self.decoder.decode(packet, &mut pcm, false)?;
-        if samples != FRAME_SAMPLES {
-            return Err(AudioError::InvalidFrameSize(samples));
-        }
+        pcm.truncate(samples);
         Ok(pcm)
     }
     fn encode(&mut self, pcm: &[i16]) -> Result<Vec<u8>, AudioError> {
