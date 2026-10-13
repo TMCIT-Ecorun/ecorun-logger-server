@@ -115,6 +115,23 @@
 
 **完了条件:** 3〜5人規模で音声が安定し、1人の切断がroom全体を巻き込まない。
 
+### Phase 4.1: Socket.IO化と分散構成対応
+
+Phase 4で実装したブラウザ向けの独自WebSocket制御プロトコルを Socket.IO に置き換え、Rust側は `socketioxide`、ブラウザ側は公式 `socket.io-client` を使用する。複数のLoggerプロセスに接続が分散しても、同じroomの参加者状態・制御イベント・音声が共有される構成を目標とする。分散共有にはユーザー指定の `socketioxide-redis` を採用候補の第一選択とし、実装開始時に現在の `socketioxide` との互換性・提供機能を確認する。
+
+- ブラウザは Socket.IO のイベント通信を使い、音声packetはイベントpayloadのbinaryデータとして送受信する。
+- ブラウザの接続先は `io(origin + "/" + encodeURIComponent(roomId), { path: "/socket.io/" })` 相当とし、Socket.IO namespaceのパス部分をroom IDとして扱う。`/socket.io/` はSocket.IO transport endpointとして固定する。
+- Loggerは接続namespaceからroom IDを決定し、接続時に対応する内部roomへ自動参加させる。クライアントから `room.join` を送ってroomを選択・変更する仕組みは廃止する。room切替は接続先namespace URLを変更して再接続する。
+- `room.state`、参加者のmute/PTT状態、切断時の退出処理は、Socket.IO接続ライフサイクルとroomイベントに合わせて再定義する。
+- 分散ノード間のroom参加者・制御イベント・音声配信を同期するadapterを導入する。`socketioxide-redis` のAPIと依存サービスの設定項目を実装開始時に確認する。単一プロセス内のroom状態だけで分散対応済みとはみなさない。
+- 分散adapterには `socketioxide-redis` を使用し、Redis接続先、認証情報の外部設定、接続再試行、障害時のログ/health表示を設計する。crateのAPI・互換バージョン・Redis経由で伝播する対象（room状態、制御イベント、音声binary payload）を実装前に確認し、未対応のデータ経路を暗黙にローカル処理へフォールバックさせない。
+- クライアントが接続先Loggerサーバを選択できるようにする。サーバ一覧はHTTP APIまたはSocket.IOイベントで取得可能にし、少なくとも識別子、接続URL、表示名、利用可否/状態を定義する。API/eventの方式、一覧の供給元（設定値または管理データ）、公開範囲と認証を実装前に確定する。秘密情報を一覧レスポンスへ含めない。
+- 接続断時は `socket.io-client` の再接続機能を有効化し、指数バックオフ等の再試行間隔、最大待機時間、接続中/再接続中/失敗状態をUIに定義する。選択したサーバが復旧しない場合の別サーバへのフェイルオーバーは、同一Redis共有状態を前提に候補リストから順次試行するか、ユーザー選択を維持するかを決める。再接続後は認証・namespace/room参加・`room.state` とparticipant状態を再同期し、重複参加者や古い状態を残さない。
+- Pi向け `/ws/audio/{room_id}` の既存WebSocketプロトコルは互換性境界として維持し、Socket.IO化の対象はブラウザ/PWA経路とする。
+- Socket.IO接続パス、room URLの形式、イベント名とpayload、binary音声形式、エラー、再接続時の状態同期を仕様として固定する。
+
+**完了条件:** ブラウザでサーバ一覧を取得・選択してURLでroomに参加でき、`room.join` を使わずに音声・参加者状態を送受信できる。Redis adapterを通じ複数Loggerプロセスに接続したクライアント同士でも同一room内で音声と状態が同期する。切断後の自動再接続と状態再同期が確認でき、選択サーバが復旧しない場合の動作が仕様どおりで、1接続の切断がroom全体を巻き込まない。
+
 ### Phase 5: メトリクス / Podium
 
 - 内部telemetry schemaを定義
@@ -162,7 +179,9 @@
 {"type":"audio.config","sample_rate":8000,"channels":1,"frame_ms":60}
 ```
 
-音声とJSONを同一WSに載せる方式はPi互換用として残し、新規Webクライアントでは必要に応じて制御WSと音声WSを分離できるよう内部設計する。
+上記は現行の独自WebSocketプロトコルの例。Phase 4.1以降のブラウザ/PWA経路では Socket.IO のイベントに移行し、`room.join` は使用しない。roomは接続URLで指定して接続時に参加する。Pi向け `/ws/audio/{room_id}` は既存互換プロトコルを維持する。
+
+音声とJSONを同一WSに載せる方式はPi互換用として残す。Phase 4.1以降のブラウザ経路はSocket.IOイベントで制御とbinary音声を扱う。
 
 ## 重要な設計判断
 

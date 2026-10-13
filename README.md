@@ -160,6 +160,11 @@ pnpm run build
 その後、ブラウザ実機で音声送受信を確認し、さらに実Piで連続運用・瞬断・帯域・遅延を測定します。
 
 詳細な移行計画とPhaseごとの完了条件は [`PLAN.md`](./PLAN.md) を参照してください。
+
+### Phase 4.1 実装
+
+ブラウザ/PWAのリアルタイム通信は `socketioxide` + `socket.io-client` を使用します。複数Loggerプロセス間のイベント配信には `socketioxide-redis` を利用できます。`ECORUN_REDIS_ENABLED=true` で有効化し、`ECORUN_REDIS_URL` と `ECORUN_REDIS_NAMESPACE` で接続先とprefixを指定します。無効時はプロセス内adapterを使用します。クライアントは `/api/servers` から接続先候補を取得し、`/{room_id}` namespaceでroomへ自動参加します。room切替時はnamespace URLを変更して再接続します。切断時は自動再接続し、復帰後にroom状態を再取得します。サーバが復旧しない場合は選択を維持し、ユーザーが接続先を切り替えます。Pi向け `/ws/audio/{room_id}` は従来のWebSocket互換経路として維持します。
+
 ## Dev Container
 
 `.devcontainer/` にRustサーバとWebクライアントの開発環境を用意しています。Docker対応のVS Codeで「Reopen in Container」を実行すると、Rust、libopus、Node.js、pnpm 10.0.0をまとめて利用できます。

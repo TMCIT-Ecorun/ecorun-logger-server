@@ -12,11 +12,17 @@ use axum::{
     Router,
 };
 use serde::{Deserialize, Serialize};
+use socketioxide::{adapter::Adapter, layer::SocketIoLayer, SocketIo};
+use socketioxide_core::adapter::DefinedAdapter;
+use socketioxide_redis::{
+    drivers::redis::redis_client as redis, RedisAdapter, RedisAdapterConfig, RedisAdapterCtr,
+};
 use tokio::{net::TcpListener, sync::mpsc, time::timeout};
 use tracing::{info, warn};
 
 mod audio;
 mod room;
+mod socketio_api;
 
 use audio::{AudioCodec, OpusCodec};
 use room::{RoomManager, SessionId};
@@ -80,11 +86,13 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let bind = std::env::var("ECORUN_BIND").unwrap_or_else(|_| DEFAULT_BIND.into());
+    let socket_state = socketio_api::SocketState::new();
     let state = AppState {
         rooms: Arc::new(RoomManager::new()),
     };
-    let app = Router::new()
+    let routes = Router::new()
         .route("/healthz", get(healthz))
+        .route("/api/servers", get(server_list))
         .route("/ws/audio/{room_id}", get(audio_ws))
         .route("/", get(web_index))
         .route("/manifest.webmanifest", get(web_manifest))
@@ -92,9 +100,47 @@ async fn main() -> anyhow::Result<()> {
         .route("/icon-192.png", get(web_icon_192))
         .route("/icon-512.png", get(web_icon_512))
         .route("/service-worker.js", get(web_service_worker))
-        .route("/_app/{*path}", get(web_asset))
-        .with_state(state);
+        .route("/_app/{*path}", get(web_asset));
 
+    let redis_enabled = std::env::var("ECORUN_REDIS_ENABLED")
+        .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
+        .unwrap_or(false);
+    if redis_enabled {
+        let redis_url =
+            std::env::var("ECORUN_REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379/".into());
+        let prefix =
+            std::env::var("ECORUN_REDIS_NAMESPACE").unwrap_or_else(|_| "ecorun-logger".into());
+        let client = redis::Client::open(redis_url).context("invalid ECORUN_REDIS_URL")?;
+        let (layer, io) = SocketIo::builder()
+            .with_state(socket_state)
+            .with_adapter::<RedisAdapter<_>>(
+                RedisAdapterCtr::new_with_redis_config(
+                    &client,
+                    RedisAdapterConfig::new().with_prefix(prefix),
+                )
+                .await
+                .context("failed to configure Socket.IO Redis adapter")?,
+            )
+            .build_layer();
+        serve_app(routes, state, layer, io, bind).await?;
+    } else {
+        let (layer, io) = SocketIo::builder().with_state(socket_state).build_layer();
+        serve_app(routes, state, layer, io, bind).await?;
+    }
+    Ok(())
+}
+
+async fn serve_app<A: Adapter + DefinedAdapter>(
+    routes: Router<AppState>,
+    state: AppState,
+    layer: SocketIoLayer<A>,
+    io: SocketIo<A>,
+    bind: String,
+) -> anyhow::Result<()> {
+    socketio_api::register(&io)
+        .await
+        .context("failed to register Socket.IO namespaces")?;
+    let app = routes.layer(layer).with_state(state);
     let listener = TcpListener::bind(&bind)
         .await
         .with_context(|| format!("failed to bind {bind}"))?;
@@ -131,6 +177,30 @@ async fn healthz() -> impl IntoResponse {
     "ok"
 }
 
+#[derive(Serialize, Deserialize)]
+struct LoggerServer {
+    id: String,
+    name: String,
+    url: String,
+    available: bool,
+}
+
+async fn server_list() -> impl IntoResponse {
+    let configured = std::env::var("ECORUN_SERVERS").unwrap_or_default();
+    let parsed = serde_json::from_str::<Vec<LoggerServer>>(&configured).unwrap_or_default();
+    let servers = if parsed.is_empty() {
+        vec![LoggerServer {
+            id: "local".into(),
+            name: "This Logger".into(),
+            url: String::new(),
+            available: true,
+        }]
+    } else {
+        parsed
+    };
+    ([(header::CACHE_CONTROL, "no-store")], axum::Json(servers))
+}
+
 async fn web_index() -> Response {
     serve_web_file("web/build/index.html", "text/html; charset=utf-8").await
 }
@@ -151,7 +221,11 @@ async fn web_icon_512() -> Response {
     serve_web_file("web/build/icon-512.png", "image/png").await
 }
 async fn web_service_worker() -> Response {
-    serve_web_file("web/build/service-worker.js", "text/javascript; charset=utf-8").await
+    serve_web_file(
+        "web/build/service-worker.js",
+        "text/javascript; charset=utf-8",
+    )
+    .await
 }
 
 async fn web_asset(Path(path): Path<String>) -> Response {
@@ -248,7 +322,10 @@ async fn handle_audio_socket(mut socket: WebSocket, state: AppState, initial_roo
         participants,
     })
     .unwrap();
-    state.rooms.broadcast_control(&initial_room_id, state_event).await;
+    state
+        .rooms
+        .broadcast_control(&initial_room_id, state_event)
+        .await;
 
     loop {
         tokio::select! {
