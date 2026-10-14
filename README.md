@@ -131,6 +131,47 @@ cargo run --bin audio_test_client -- ws://127.0.0.1:3000/ws/audio/main main 60
 | --- | --- | --- |
 | `ECORUN_BIND` | `0.0.0.0:3000` | HTTP/WebSocket待受アドレス |
 | `RUST_LOG` | `ecorun_logger_server=info` | ログレベル |
+| `ECORUN_PODIUM_KEYS` | 空（中継しない） | room ID → Podiumストリーミングキー のJSON。例 `{"main":"XXXXXXXX"}`。**キーはGitに入れない** |
+| `ECORUN_PODIUM_ENDPOINT` | `telemetry.podium.live:8080` | Podium Connectの接続先（試験時は偽Podiumへ向ける） |
+| `ECORUN_PODIUM_SERIAL` | `C3PROTO01` | 認証の `sn`（この値で認証が通ることを確認済み） |
+
+## Podium中継（Phase 5の一部）
+
+ロガー（EcoLogger）は既存の `/ws/audio/{room_id}`（Socket.IOではない方）でPodium形式の行を送り、
+サーバがPodium Connectとの接続（認証・連番・生存確認・再接続）を受け持ちます。ストリーミングキーはサーバ側の
+`ECORUN_PODIUM_KEYS` だけに置き、ロガーとの間では流しません（Podium Connect自体は暗号化なしのTCPのため）。
+
+ロガー → サーバ（text message）:
+
+```json
+{"type":"hello","client_id":"ecologger-v2","protocol":2,"receive_audio":false}
+{"type":"podium.meta","meta":[{"nm":"Interval","ut":"ms","sr":10,"min":0,"max":0,"prec":0}, ...]}
+{"type":"podium.samples","samples":[[12300,1791077786762,34.843112,...,63], ...]}
+```
+
+- `meta` はPodiumの `{"s":{"meta":[...]}}` の中身そのまま。チャンネル構成が変わったら送り直す
+- `samples` の各行はPodiumの `d`（値をmeta順に並べ、最後にビットマスク）。1メッセージ最大50行（ロガーは5行ずつ）。`t` はサーバが振る
+- `receive_audio:false` を送ったセッションには、同じroomの通話音声を流さない（LTEの通信量対策）
+- 中継はroomごとに1本。1つのroomに送るロガーは1台にする
+
+サーバ → room内の全員（text message）:
+
+```json
+{"type":"podium.status","room_id":"main","state":"streaming","lt":44}
+{"type":"error","code":"podium_not_configured","message":"..."}
+```
+
+`state` は `connecting` / `streaming` / `error` / `idle`（ロガーが60秒黙ったら切断）/ `waiting_meta`。
+`lt` はPodiumの生存確認（約5秒ごと）で返る「最後に受け取ったサンプル番号」。
+
+注意：新Podiumは**GNSS由来の `Utc` が入るまでストリームを表示しない**。測位待ちの判断はロガー側で行い、サーバは中身を変えずに中継する。
+
+偽Podiumを使った通し試験:
+
+```bash
+ECORUN_PODIUM_ENDPOINT=127.0.0.1:18080 ECORUN_PODIUM_KEYS='{"podium-test":"TESTKEY1"}' cargo run
+cargo run --bin podium_relay_test
+```
 
 ## 現在の機能
 
@@ -144,6 +185,7 @@ cargo run --bin audio_test_client -- ws://127.0.0.1:3000/ws/audio/main main 60
 - SvelteKit PWA（room UI / PTT / telemetry表示）
 - WebCodecs Opus のブラウザ送受信経路
 - `web/build` の Rust 静的配信
+- `/ws/audio/{room_id}` で受けたテレメトリのPodium Connect中継（下記）
 
 ## 現在の状態と残作業
 
