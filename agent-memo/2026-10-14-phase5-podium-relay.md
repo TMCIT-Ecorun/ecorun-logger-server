@@ -10,7 +10,7 @@
   - ストリーミングキーは環境変数 `ECORUN_PODIUM_KEYS`（room → key）だけに置く。ロガーとの間では流さない。
   - ロガーが60秒黙ったらPodiumを切断し、次のデータで再接続する。
   - Podiumが遅いときは新しいバッチを捨てる（遅延をためない）。`meta` は捨てない。
-- `src/main.rs`：`podium.meta` / `podium.samples` の受信、hello の `receive_audio:false`（通話音声を流さない）を追加。
+- `src/main.rs`：`podium.meta` / `podium.samples` の受信、hello の `audio_formats`（再生できる音声形式。空なら通話音声を流さない）を追加。
 - `serde_json` に `preserve_order` を付けた。Podiumへ送るJSONのキー順を、実測で認証が通った公式アプリと同じにするため
   （無いとキーがアルファベット順に並び替わる）。
 

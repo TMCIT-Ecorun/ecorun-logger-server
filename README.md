@@ -144,14 +144,16 @@ cargo run --bin audio_test_client -- ws://127.0.0.1:3000/ws/audio/main main 60
 ロガー → サーバ（text message）:
 
 ```json
-{"type":"hello","client_id":"ecologger-v2","protocol":2,"receive_audio":false}
+{"type":"hello","client_id":"ecologger-v2","protocol":2,"audio_formats":[]}
 {"type":"podium.meta","meta":[{"nm":"Interval","ut":"ms","sr":10,"min":0,"max":0,"prec":0}, ...]}
 {"type":"podium.samples","samples":[[12300,1791077786762,34.843112,...,63], ...]}
 ```
 
 - `meta` はPodiumの `{"s":{"meta":[...]}}` の中身そのまま。チャンネル構成が変わったら送り直す
 - `samples` の各行はPodiumの `d`（値をmeta順に並べ、最後にビットマスク）。1メッセージ最大50行（ロガーは5行ずつ）。`t` はサーバが振る
-- `receive_audio:false` を送ったセッションには、同じroomの通話音声を流さない（LTEの通信量対策）
+- hello の `audio_formats` はクライアントが再生できる音声形式の一覧（`audio.config` と同じ `sample_rate`・`channels`・`frame_ms`）。
+  サーバの形式を含まないクライアントには通話音声を流さない。ロガーは空の一覧を送る（LTEの通信量対策）。
+  省略したクライアント（既存のPi・ブラウザ）はこれまでどおり受け取る
 - 中継はroomごとに1本。1つのroomに送るロガーは1台にする
 
 サーバ → room内の全員（text message）:

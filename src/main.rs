@@ -49,10 +49,11 @@ enum ControlEvent {
         client_id: Option<String>,
         #[serde(default)]
         protocol: Option<u8>,
-        /// Telemetry-only clients (EcoLogger over LTE) set this to false so the
-        /// room's voice traffic is not pushed down their metered link.
+        /// Audio formats the client can play. Omitted: assume the server's
+        /// format (existing clients). Empty: the client takes no audio, e.g. a
+        /// telemetry-only logger on a metered LTE link.
         #[serde(default)]
-        receive_audio: Option<bool>,
+        audio_formats: Option<Vec<AudioFormat>>,
     },
     #[serde(rename = "room.join", alias = "room_join")]
     RoomJoin { room_id: String },
@@ -70,6 +71,24 @@ enum ControlEvent {
     PodiumSamples {
         samples: Vec<Vec<serde_json::Value>>,
     },
+}
+
+#[derive(Debug, Deserialize, PartialEq)]
+struct AudioFormat {
+    sample_rate: u32,
+    channels: u8,
+    frame_ms: u16,
+}
+
+impl AudioFormat {
+    fn is_server_format(&self) -> bool {
+        *self
+            == AudioFormat {
+                sample_rate: audio::SAMPLE_RATE,
+                channels: 1,
+                frame_ms: audio::FRAME_MS,
+            }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -376,8 +395,9 @@ async fn handle_audio_socket(mut socket: WebSocket, state: AppState, initial_roo
                         }
                     }
                     Some(Ok(Message::Text(text))) => match serde_json::from_str::<ControlEvent>(&text) {
-                        Ok(ControlEvent::Hello { client_id, protocol, receive_audio: wants_audio }) => {
-                            receive_audio = wants_audio.unwrap_or(true);
+                        Ok(ControlEvent::Hello { client_id, protocol, audio_formats }) => {
+                            receive_audio = audio_formats
+                                .map_or(true, |formats| formats.iter().any(AudioFormat::is_server_format));
                             info!(%session_id, ?client_id, ?protocol, receive_audio, "client hello");
                         }
                         Ok(ControlEvent::RoomJoin { room_id: requested }) => {
