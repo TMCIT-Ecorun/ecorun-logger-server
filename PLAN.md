@@ -142,6 +142,9 @@ Phase 4で実装したブラウザ向けの独自WebSocket制御プロトコル�
 
 **完了条件:** EcoLoggerとPodium双方の値を同じUIで識別表示でき、切断復旧が確認できる。
 
+2026-10-14 進捗：EcoLogger → `/ws/audio/{room_id}` → Podium Connect の中継を先行実装（`src/podium.rs`、README「Podium中継」）。
+Podiumの接続仕様は次世代Podium（2026-10-04実測）に合わせた。内部telemetry schema・ブラウザ表示・ログ保存は未着手。
+
 ### Phase 6: 認証・公開・運用
 
 - Tailscale Funnelを入口にしたHTTPS/WSS

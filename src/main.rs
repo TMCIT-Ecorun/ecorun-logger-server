@@ -21,10 +21,12 @@ use tokio::{net::TcpListener, sync::mpsc, time::timeout};
 use tracing::{info, warn};
 
 mod audio;
+mod podium;
 mod room;
 mod socketio_api;
 
 use audio::{AudioCodec, OpusCodec};
+use podium::PodiumHub;
 use room::{RoomManager, SessionId};
 
 const DEFAULT_BIND: &str = "0.0.0.0:3000";
@@ -35,6 +37,7 @@ const CONTROL_QUEUE_CAPACITY: usize = 32;
 #[derive(Clone)]
 struct AppState {
     rooms: Arc<RoomManager>,
+    podium: Arc<PodiumHub>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -46,6 +49,10 @@ enum ControlEvent {
         client_id: Option<String>,
         #[serde(default)]
         protocol: Option<u8>,
+        /// Telemetry-only clients (EcoLogger over LTE) set this to false so the
+        /// room's voice traffic is not pushed down their metered link.
+        #[serde(default)]
+        receive_audio: Option<bool>,
     },
     #[serde(rename = "room.join", alias = "room_join")]
     RoomJoin { room_id: String },
@@ -55,6 +62,14 @@ enum ControlEvent {
     AudioMute { muted: bool },
     #[serde(rename = "audio.ptt", alias = "ptt")]
     AudioPtt { active: bool },
+    /// Podium channel definitions (`{"s":{"meta":[...]}}` contents) from a logger.
+    #[serde(rename = "podium.meta")]
+    PodiumMeta { meta: Vec<serde_json::Value> },
+    /// Podium sample rows (`d` arrays: values then bitmasks), batched by the logger.
+    #[serde(rename = "podium.samples")]
+    PodiumSamples {
+        samples: Vec<Vec<serde_json::Value>>,
+    },
 }
 
 #[derive(Debug, Serialize)]
@@ -87,8 +102,10 @@ async fn main() -> anyhow::Result<()> {
 
     let bind = std::env::var("ECORUN_BIND").unwrap_or_else(|_| DEFAULT_BIND.into());
     let socket_state = socketio_api::SocketState::new();
+    let rooms = Arc::new(RoomManager::new());
     let state = AppState {
-        rooms: Arc::new(RoomManager::new()),
+        podium: Arc::new(PodiumHub::from_env(rooms.clone())),
+        rooms,
     };
     let routes = Router::new()
         .route("/healthz", get(healthz))
@@ -271,6 +288,7 @@ async fn handle_audio_socket(mut socket: WebSocket, state: AppState, initial_roo
     let (audio_tx, mut audio_rx) = mpsc::channel::<Vec<u8>>(AUDIO_QUEUE_CAPACITY);
     let (control_tx, mut control_rx) = mpsc::channel::<String>(CONTROL_QUEUE_CAPACITY);
     let mut room_id: Option<String> = Some(initial_room_id.clone());
+    let mut receive_audio = true;
     let mut codec = match OpusCodec::new() {
         Ok(codec) => codec,
         Err(error) => {
@@ -330,7 +348,7 @@ async fn handle_audio_socket(mut socket: WebSocket, state: AppState, initial_roo
     loop {
         tokio::select! {
             outbound = audio_rx.recv() => match outbound {
-                Some(packet) => if socket.send(Message::Binary(packet.into())).await.is_err() { break },
+                Some(packet) => if receive_audio && socket.send(Message::Binary(packet.into())).await.is_err() { break },
                 None => break,
             },
             event = control_rx.recv() => match event {
@@ -358,8 +376,9 @@ async fn handle_audio_socket(mut socket: WebSocket, state: AppState, initial_roo
                         }
                     }
                     Some(Ok(Message::Text(text))) => match serde_json::from_str::<ControlEvent>(&text) {
-                        Ok(ControlEvent::Hello { client_id, protocol }) => {
-                            info!(%session_id, ?client_id, ?protocol, "client hello");
+                        Ok(ControlEvent::Hello { client_id, protocol, receive_audio: wants_audio }) => {
+                            receive_audio = wants_audio.unwrap_or(true);
+                            info!(%session_id, ?client_id, ?protocol, receive_audio, "client hello");
                         }
                         Ok(ControlEvent::RoomJoin { room_id: requested }) => {
                             if requested.is_empty() || requested.len() > 64 {
@@ -416,6 +435,24 @@ async fn handle_audio_socket(mut socket: WebSocket, state: AppState, initial_roo
                                         room_id: room, participants,
                                     }).unwrap();
                                     state.rooms.broadcast_control(room, state_event).await;
+                                }
+                            }
+                        }
+                        Ok(ControlEvent::PodiumMeta { meta }) => {
+                            if let Some(room) = room_id.as_deref() {
+                                if let Err(error) = state.podium.meta(room, meta).await {
+                                    let _ = control_tx.try_send(serde_json::to_string(&ServerEvent::Error {
+                                        code: error.code(), message: error.message(),
+                                    }).unwrap());
+                                }
+                            }
+                        }
+                        Ok(ControlEvent::PodiumSamples { samples }) => {
+                            if let Some(room) = room_id.as_deref() {
+                                if let Err(error) = state.podium.samples(room, samples).await {
+                                    let _ = control_tx.try_send(serde_json::to_string(&ServerEvent::Error {
+                                        code: error.code(), message: error.message(),
+                                    }).unwrap());
                                 }
                             }
                         }
