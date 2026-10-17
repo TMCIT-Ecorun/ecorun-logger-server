@@ -8,9 +8,9 @@ default-run = "ecorun-logger-server"
 anyhow = "1"
 axum = { version = "0.8", features = ["ws"] }
 bytes = "1"
+libc = "0.2"
 socketioxide = { version = "0.18.7", features = ["state"] }
 socketioxide-core = "0.19.0"
-socketioxide-redis = "0.4.3"
 futures-util = "0.3"
 opus = "0.3"
 serde = { version = "1", features = ["derive"] }
@@ -20,3 +20,6 @@ tokio-tungstenite = "0.28"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 tower = "0.5"
+rusqlite = { version = "0.37", features = ["bundled"] }
+ratatui = "0.29"
+crossterm = "0.28"

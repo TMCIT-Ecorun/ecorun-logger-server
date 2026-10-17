@@ -1,7 +1,8 @@
 //! End-to-end check of the Podium relay against a fake Podium server.
 //!
-//! Start the logger server pointed at the fake Podium first:
-//!   ECORUN_PODIUM_ENDPOINT=127.0.0.1:18080 ECORUN_PODIUM_KEYS='{"podium-test":"TESTKEY1"}' cargo run
+//! Create `podium-test` in `cargo run -- admin` and set its Podium key to `TESTKEY1`,
+//! then start the logger server pointed at the fake Podium:
+//!   ECORUN_PODIUM_ENDPOINT=127.0.0.1:18080 cargo run
 //! then run:
 //!   cargo run --bin podium_relay_test [ws://127.0.0.1:3000]
 //!
@@ -43,17 +44,27 @@ async fn main() -> Result<()> {
         {"nm":"Utc","ut":"ms","sr":10,"min":0,"max":0,"prec":0},
         {"nm":"Latitude","ut":"deg","sr":10,"min":-90,"max":90,"prec":6},
     ]);
-    ws.send(Message::Text(json!({"type":"podium.meta","meta":meta}).to_string().into()))
-        .await?;
+    ws.send(Message::Text(
+        json!({"type":"podium.meta","meta":meta}).to_string().into(),
+    ))
+    .await?;
     let rows: Vec<Value> = (0..5)
         .map(|i| json!([100 * i, 1_791_077_786_762u64 + 100 * i, 34.843112, 7]))
         .collect();
-    ws.send(Message::Text(json!({"type":"podium.samples","samples":rows}).to_string().into()))
-        .await?;
+    ws.send(Message::Text(
+        json!({"type":"podium.samples","samples":rows})
+            .to_string()
+            .into(),
+    ))
+    .await?;
 
     // Invalid input must be rejected without killing the session.
-    ws.send(Message::Text(json!({"type":"podium.samples","samples":[["x"]]}).to_string().into()))
-        .await?;
+    ws.send(Message::Text(
+        json!({"type":"podium.samples","samples":[["x"]]})
+            .to_string()
+            .into(),
+    ))
+    .await?;
 
     let mut saw_error = false;
     let mut saw_heartbeat = false;
@@ -62,7 +73,9 @@ async fn main() -> Result<()> {
             .await
             .context("timed out waiting for podium.status / error")?
             .context("server closed connection")??;
-        let Message::Text(text) = message else { continue };
+        let Message::Text(text) = message else {
+            continue;
+        };
         let event: Value = serde_json::from_str(&text)?;
         println!("server -> {event}");
         match event["type"].as_str() {
@@ -73,7 +86,9 @@ async fn main() -> Result<()> {
         }
     }
     podium.await??;
-    println!("OK: auth, meta, 5 batched samples with t=0..4, heartbeat relayed, bad batch rejected");
+    println!(
+        "OK: auth, meta, 5 batched samples with t=0..4, heartbeat relayed, bad batch rejected"
+    );
     Ok(())
 }
 
@@ -96,7 +111,10 @@ async fn fake_podium(listener: TcpListener) -> Result<()> {
     );
     let auth: Value = serde_json::from_str(&raw_auth)?;
     ensure!(auth["cmd"]["auth"]["deviceId"] == KEY, "bad auth: {auth}");
-    ensure!(auth["cmd"]["auth"]["apiVer"] == 1.1, "auth must use the new format: {auth}");
+    ensure!(
+        auth["cmd"]["auth"]["apiVer"] == 1.1,
+        "auth must use the new format: {auth}"
+    );
     write
         .write_all(b"{\"status\":\"ok\",\"utc\":1791077774462,\"lt\":0}\n")
         .await?;
@@ -106,7 +124,10 @@ async fn fake_podium(listener: TcpListener) -> Result<()> {
     for t in 0..5u64 {
         let sample = next(&mut lines).await?;
         ensure!(sample["s"]["t"] == t, "sample {t} out of order: {sample}");
-        ensure!(sample["s"]["d"][2] == 34.843112, "latitude precision lost: {sample}");
+        ensure!(
+            sample["s"]["d"][2] == 34.843112,
+            "latitude precision lost: {sample}"
+        );
     }
     write.write_all(b"{\"hb\":{\"lt\":4}}\n").await?;
     // Keep the socket open until the client has seen the heartbeat.

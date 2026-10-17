@@ -1,4 +1,4 @@
-use opus::{Application, Channels, Decoder, Encoder, Error as OpusError};
+use opus::{Application, Bitrate, Channels, Decoder, Encoder, Error as OpusError};
 use std::fmt;
 
 pub const SAMPLE_RATE: u32 = 8_000;
@@ -49,6 +49,12 @@ impl OpusCodec {
             encoder: Encoder::new(8000, Channels::Mono, Application::Voip)?,
             decoder: Decoder::new(8000, Channels::Mono)?,
         })
+    }
+
+    pub fn set_bitrate(&mut self, bitrate: u32) -> Result<(), AudioError> {
+        self.encoder
+            .set_bitrate(Bitrate::Bits(bitrate as i32))
+            .map_err(AudioError::from)
     }
 }
 

@@ -20,6 +20,9 @@ web/.svelte-kit/
 *.log
 run/
 data/
+ecorun.sqlite3
+ecorun.sqlite3-wal
+ecorun.sqlite3-shm
 
 # Local agent state
 .codex/

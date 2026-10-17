@@ -4,7 +4,7 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use socketioxide::{
     adapter::Adapter,
-    extract::{Data, SocketRef, State},
+    extract::{Data, SocketRef, State, TryData},
     socket::DisconnectReason,
     SocketIo,
 };
@@ -12,9 +12,20 @@ use socketioxide_core::adapter::DefinedAdapter;
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 
+use crate::config::RoomStore;
+use crate::map::{MapConfig, MapStore};
+
 #[derive(Clone)]
 pub struct SocketState {
     participants: Arc<RwLock<HashMap<String, HashMap<String, Participant>>>>,
+    pub map: Arc<MapStore>,
+    pub rooms: Arc<RoomStore>,
+}
+
+#[derive(Deserialize)]
+struct SocketAuth {
+    #[serde(default)]
+    token: String,
 }
 
 #[derive(Clone, Serialize)]
@@ -33,10 +44,22 @@ struct PttPayload {
     active: bool,
 }
 
+#[derive(Deserialize)]
+struct TelemetryPayload {
+    #[serde(default)]
+    source: Option<String>,
+    #[serde(default)]
+    timestamp: Option<String>,
+    #[serde(default)]
+    data: Option<serde_json::Value>,
+}
+
 impl SocketState {
-    pub fn new() -> Self {
+    pub fn new(map: Arc<MapStore>, rooms: Arc<RoomStore>) -> Self {
         Self {
             participants: Arc::new(RwLock::new(HashMap::new())),
+            map,
+            rooms,
         }
     }
 }
@@ -52,9 +75,23 @@ async fn on_root<A: Adapter>(socket: SocketRef<A>) {
     socket.emit("error", &serde_json::json!({"code":"room_required","message":"Connect to a /{room_id} namespace"})).ok();
 }
 
-async fn on_room<A: Adapter>(socket: SocketRef<A>, State(state): State<SocketState>) {
+async fn on_room<A: Adapter>(
+    socket: SocketRef<A>,
+    State(state): State<SocketState>,
+    TryData(auth): TryData<SocketAuth>,
+) {
     let room = socket.ns().trim_start_matches('/').to_owned();
-    if room.is_empty() || room.len() > 64 || room.contains('/') {
+    let auth_token = auth.map(|value| value.token).unwrap_or_default();
+    let authenticated = state
+        .rooms
+        .authenticate(&room, &auth_token)
+        .unwrap_or(false);
+    if room.is_empty()
+        || room.len() > 64
+        || room.contains('/')
+        || !state.rooms.exists(&room).unwrap_or(false)
+        || !authenticated
+    {
         socket.disconnect().ok();
         return;
     }
@@ -96,6 +133,9 @@ async fn on_room<A: Adapter>(socket: SocketRef<A>, State(state): State<SocketSta
             &serde_json::json!({"room_id":room,"participants":participants}),
         )
         .ok();
+    if let Ok(map) = state.map.get_map(&room) {
+        socket.emit("map.state", &map).ok();
+    }
     if let Err(error) = socket
         .to(room.clone())
         .emit(
@@ -174,6 +214,44 @@ async fn on_room<A: Adapter>(socket: SocketRef<A>, State(state): State<SocketSta
             }
         }
     });
+
+    socket.on(
+        "map.update",
+        move |socket: SocketRef<A>,
+              State(state): State<SocketState>,
+              Data(map): Data<MapConfig>| async move {
+            let room = socket.ns().trim_start_matches('/').to_owned();
+            if !state.rooms.exists(&room).unwrap_or(false)
+                || !map.center_lat.is_finite()
+                || !map.center_lon.is_finite()
+                || !map.zoom.is_finite()
+                || map.zoom < 0.0
+                || map.zoom > 24.0
+            {
+                return;
+            }
+            if state.map.save_map(&room, &map).is_ok() {
+                let _ = socket.to(room).emit("map.state", &map).await;
+            }
+        },
+    );
+
+    socket.on(
+        "telemetry",
+        move |socket: SocketRef<A>, State(state): State<SocketState>, Data(payload): Data<TelemetryPayload>| async move {
+            let room = socket.ns().trim_start_matches('/').to_owned();
+            if !state.rooms.exists(&room).unwrap_or(false) { return; }
+            let source = payload.source.unwrap_or_else(|| "web-client".into());
+            let data = payload.data.unwrap_or_else(|| serde_json::json!({}));
+            match state.map.append_telemetry(&room, &source, payload.timestamp.as_deref(), &data) {
+                Ok(id) => {
+                    let event = serde_json::json!({"type":"telemetry","id":id,"source":source,"timestamp":payload.timestamp,"data":data});
+                    let _ = socket.to(room).emit("telemetry", &event).await;
+                }
+                Err(error) => warn!(%error, "failed to persist Socket.IO telemetry"),
+            }
+        },
+    );
 
     socket.on_disconnect(move |socket: SocketRef<A>, _reason: DisconnectReason, State(state): State<SocketState>| async move {
         let room = socket.ns().trim_start_matches('/').to_owned();
