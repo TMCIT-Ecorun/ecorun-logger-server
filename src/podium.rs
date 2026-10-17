@@ -28,6 +28,7 @@ use tokio::{
 };
 use tracing::{info, warn};
 
+use crate::config::RoomStore;
 use crate::room::RoomManager;
 
 const DEFAULT_ENDPOINT: &str = "telemetry.podium.live:8080";
@@ -95,38 +96,14 @@ impl RelayError {
 struct Config {
     endpoint: String,
     serial: String,
-    /// room_id -> streaming key
-    keys: HashMap<String, String>,
 }
 
 impl Config {
     fn from_env() -> Self {
-        let keys = std::env::var("ECORUN_PODIUM_KEYS")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .and_then(|value| match serde_json::from_str::<HashMap<String, String>>(&value) {
-                Ok(keys) => Some(keys),
-                Err(error) => {
-                    warn!(%error, "ECORUN_PODIUM_KEYS is not a JSON object of room -> key; Podium relay disabled");
-                    None
-                }
-            })
-            .unwrap_or_default();
-        let keys = keys
-            .into_iter()
-            .filter(|(room, key)| {
-                let ok = !key.is_empty() && key.bytes().all(|b| (0x21..=0x7e).contains(&b) && b != b'"' && b != b'\\');
-                if !ok {
-                    warn!(%room, "ignoring Podium key with non-printable or quote characters");
-                }
-                ok
-            })
-            .collect();
         Self {
             endpoint: std::env::var("ECORUN_PODIUM_ENDPOINT")
                 .unwrap_or_else(|_| DEFAULT_ENDPOINT.into()),
             serial: std::env::var("ECORUN_PODIUM_SERIAL").unwrap_or_else(|_| DEFAULT_SERIAL.into()),
-            keys,
         }
     }
 }
@@ -134,20 +111,18 @@ impl Config {
 pub struct PodiumHub {
     config: Arc<Config>,
     rooms: Arc<RoomManager>,
+    room_config: Arc<RoomStore>,
     relays: Mutex<HashMap<String, mpsc::Sender<Command>>>,
 }
 
 impl PodiumHub {
-    pub fn from_env(rooms: Arc<RoomManager>) -> Self {
+    pub fn from_env(rooms: Arc<RoomManager>, room_config: Arc<RoomStore>) -> Self {
         let config = Config::from_env();
-        info!(
-            endpoint = %config.endpoint,
-            rooms = ?config.keys.keys().collect::<Vec<_>>(),
-            "Podium relay configured"
-        );
+        info!(endpoint = %config.endpoint, "Podium relay configured");
         Self {
             config: Arc::new(config),
             rooms,
+            room_config,
             relays: Mutex::new(HashMap::new()),
         }
     }
@@ -163,7 +138,13 @@ impl PodiumHub {
     }
 
     async fn send(&self, room_id: &str, command: Command) -> Result<(), RelayError> {
-        let Some(key) = self.config.keys.get(room_id).cloned() else {
+        let Some(key) = self
+            .room_config
+            .get(room_id)
+            .map_err(|_| RelayError::NotConfigured)?
+            .and_then(|room| room.podium_key)
+            .filter(|key| !key.is_empty())
+        else {
             return Err(RelayError::NotConfigured);
         };
         let mut relays = self.relays.lock().await;
@@ -196,8 +177,15 @@ fn validate_meta(meta: &[Value]) -> Result<(), RelayError> {
             return Err(RelayError::Invalid("meta entries must be objects"));
         };
         match object.get("nm").and_then(Value::as_str) {
-            Some(name) if !name.is_empty() && name.len() <= 32 && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') => {}
-            _ => return Err(RelayError::Invalid("meta nm must be 1..32 ASCII letters/digits")),
+            Some(name)
+                if !name.is_empty()
+                    && name.len() <= 32
+                    && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') => {}
+            _ => {
+                return Err(RelayError::Invalid(
+                    "meta nm must be 1..32 ASCII letters/digits",
+                ))
+            }
         }
     }
     if !is_ascii_json(&Value::Array(meta.to_vec())) {
@@ -214,7 +202,9 @@ fn validate_samples(samples: &[Vec<Value>]) -> Result<(), RelayError> {
     let max_len = MAX_CHANNELS + MAX_CHANNELS / 32;
     for row in samples {
         if row.is_empty() || row.len() > max_len || !row.iter().all(Value::is_number) {
-            return Err(RelayError::Invalid("sample rows must be non-empty numeric arrays"));
+            return Err(RelayError::Invalid(
+                "sample rows must be non-empty numeric arrays",
+            ));
         }
     }
     Ok(())
@@ -279,7 +269,9 @@ async fn run_relay(
     loop {
         // Wait for the logger to be active before (re)opening Podium. Samples
         // arriving before a channel definition cannot be interpreted; drop them.
-        let Some(command) = rx.recv().await else { return };
+        let Some(command) = rx.recv().await else {
+            return;
+        };
         match command {
             Command::Meta(value) => meta = Some(value),
             Command::Samples(_) => {}
@@ -305,7 +297,12 @@ async fn run_relay(
                 // Drop whatever the logger sent while we wait, keeping the
                 // newest channel definition.
                 let deadline = Instant::now() + backoff;
-                while let Ok(Some(command)) = timeout(deadline.saturating_duration_since(Instant::now()), rx.recv()).await {
+                while let Ok(Some(command)) = timeout(
+                    deadline.saturating_duration_since(Instant::now()),
+                    rx.recv(),
+                )
+                .await
+                {
                     if let Command::Meta(value) = command {
                         meta = Some(value);
                     }
@@ -357,7 +354,9 @@ async fn session(
         if read == 0 {
             anyhow::bail!("Podium closed the connection during auth (streaming key rejected?)");
         }
-        let Ok(response) = serde_json::from_str::<Value>(&buffer) else { continue };
+        let Ok(response) = serde_json::from_str::<Value>(&buffer) else {
+            continue;
+        };
         match response.get("status").and_then(Value::as_str) {
             Some("ok") => break,
             Some(other) => anyhow::bail!("Podium auth status {other}"),
