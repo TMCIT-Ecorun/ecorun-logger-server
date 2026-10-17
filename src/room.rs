@@ -15,6 +15,8 @@ struct Participant {
     control_tx: ControlSender,
     muted: bool,
     ptt: bool,
+    pub is_logger: bool,
+    receive_audio: bool,
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -45,6 +47,7 @@ impl RoomManager {
         session_id: SessionId,
         audio_tx: AudioSender,
         control_tx: ControlSender,
+        is_logger: bool,
     ) {
         let mut rooms = self.rooms.write().await;
         rooms.entry(room_id.to_owned()).or_default().insert(
@@ -54,6 +57,8 @@ impl RoomManager {
                 control_tx,
                 muted: false,
                 ptt: false,
+                is_logger,
+                receive_audio: true,
             },
         );
     }
@@ -114,6 +119,33 @@ impl RoomManager {
         participant.ptt = ptt && !participant.muted;
         true
     }
+    pub async fn set_logger(&self, room_id: &str, session_id: SessionId, is_logger: bool) -> bool {
+        let mut rooms = self.rooms.write().await;
+        let Some(participant) = rooms
+            .get_mut(room_id)
+            .and_then(|room| room.get_mut(&session_id))
+        else {
+            return false;
+        };
+        participant.is_logger = is_logger;
+        true
+    }
+    pub async fn set_receive_audio(
+        &self,
+        room_id: &str,
+        session_id: SessionId,
+        receive_audio: bool,
+    ) -> bool {
+        let mut rooms = self.rooms.write().await;
+        let Some(participant) = rooms
+            .get_mut(room_id)
+            .and_then(|room| room.get_mut(&session_id))
+        else {
+            return false;
+        };
+        participant.receive_audio = receive_audio;
+        true
+    }
     pub async fn broadcast_audio(&self, room_id: &str, sender: SessionId, packet: Vec<u8>) {
         let rooms = self.rooms.read().await;
         let Some(room) = rooms.get(room_id) else {
@@ -126,7 +158,10 @@ impl RoomManager {
             return;
         }
         for (&session_id, participant) in room {
-            if session_id != sender {
+            if session_id != sender
+                && participant.receive_audio
+                && (!participant.is_logger || !source.is_logger)
+            {
                 let _ = participant.audio_tx.try_send(packet.clone());
             }
         }

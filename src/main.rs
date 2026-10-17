@@ -6,7 +6,7 @@ use axum::{
         ws::{Message, WebSocket, WebSocketUpgrade},
         Path, State,
     },
-    http::{header, HeaderValue, StatusCode},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::get,
     Router,
@@ -14,17 +14,20 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use socketioxide::{adapter::Adapter, layer::SocketIoLayer, SocketIo};
 use socketioxide_core::adapter::DefinedAdapter;
-use socketioxide_redis::{
-    drivers::redis::redis_client as redis, RedisAdapter, RedisAdapterConfig, RedisAdapterCtr,
-};
 use tokio::{net::TcpListener, sync::mpsc, time::timeout};
 use tracing::{info, warn};
 
+mod admin;
 mod audio;
+mod config;
+mod map;
+mod podium;
 mod room;
 mod socketio_api;
 
 use audio::{AudioCodec, OpusCodec};
+use config::RoomStore;
+use podium::PodiumHub;
 use room::{RoomManager, SessionId};
 
 const DEFAULT_BIND: &str = "0.0.0.0:3000";
@@ -34,7 +37,10 @@ const CONTROL_QUEUE_CAPACITY: usize = 32;
 
 #[derive(Clone)]
 struct AppState {
+    rooms_config: Arc<RoomStore>,
     rooms: Arc<RoomManager>,
+    podium: Arc<PodiumHub>,
+    map: Arc<map::MapStore>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -46,15 +52,61 @@ enum ControlEvent {
         client_id: Option<String>,
         #[serde(default)]
         protocol: Option<u8>,
+        /// Audio formats the client can play. Omitted: assume the server's
+        /// format (existing clients). Empty: the client takes no audio, e.g. a
+        /// telemetry-only logger on a metered LTE link.
+        #[serde(default)]
+        audio_formats: Option<Vec<AudioFormat>>,
+        #[serde(default)]
+        role: Option<String>,
+        #[serde(default)]
+        audio_config: Option<AudioFormat>,
+        #[serde(default)]
+        bitrate: Option<u32>,
+        #[serde(default)]
+        mixer: Option<bool>,
+        #[serde(default)]
+        forward_to_logger: Option<bool>,
     },
-    #[serde(rename = "room.join", alias = "room_join")]
-    RoomJoin { room_id: String },
-    #[serde(rename = "room.leave", alias = "room_leave")]
-    RoomLeave,
     #[serde(rename = "audio.mute", alias = "mute")]
     AudioMute { muted: bool },
     #[serde(rename = "audio.ptt", alias = "ptt")]
     AudioPtt { active: bool },
+    /// Podium channel definitions (`{"s":{"meta":[...]}}` contents) from a logger.
+    #[serde(rename = "podium.meta")]
+    PodiumMeta { meta: Vec<serde_json::Value> },
+    /// Podium sample rows (`d` arrays: values then bitmasks), batched by the logger.
+    #[serde(rename = "podium.samples")]
+    PodiumSamples {
+        samples: Vec<Vec<serde_json::Value>>,
+    },
+    #[serde(rename = "telemetry")]
+    Telemetry {
+        #[serde(default)]
+        source: Option<String>,
+        #[serde(default)]
+        timestamp: Option<String>,
+        #[serde(default)]
+        data: Option<serde_json::Value>,
+    },
+}
+
+#[derive(Debug, Deserialize, PartialEq)]
+struct AudioFormat {
+    sample_rate: u32,
+    channels: u8,
+    frame_ms: u16,
+}
+
+impl AudioFormat {
+    fn is_server_format(&self) -> bool {
+        *self
+            == AudioFormat {
+                sample_rate: audio::SAMPLE_RATE,
+                channels: 1,
+                frame_ms: audio::FRAME_MS,
+            }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -79,6 +131,10 @@ enum ServerEvent<'a> {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let db_path = std::env::var("ECORUN_DB_PATH").unwrap_or_else(|_| "ecorun.sqlite3".into());
+    if std::env::args().nth(1).as_deref() == Some("admin") {
+        return admin::run(&db_path);
+    }
     tracing_subscriber::fmt()
         .with_env_filter(
             std::env::var("RUST_LOG").unwrap_or_else(|_| "ecorun_logger_server=info".into()),
@@ -86,13 +142,23 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let bind = std::env::var("ECORUN_BIND").unwrap_or_else(|_| DEFAULT_BIND.into());
-    let socket_state = socketio_api::SocketState::new();
+    let rooms = Arc::new(RoomManager::new());
+    let rooms_config = Arc::new(RoomStore::open(&db_path).context("failed to open room database")?);
+    let map = Arc::new(map::MapStore::open(&db_path).context("failed to open SQLite database")?);
+    let socket_state = socketio_api::SocketState::new(map.clone(), rooms_config.clone());
+    let podium = Arc::new(PodiumHub::from_env(rooms.clone(), rooms_config.clone()));
     let state = AppState {
-        rooms: Arc::new(RoomManager::new()),
+        rooms_config,
+        podium,
+        map: map.clone(),
+        rooms,
     };
     let routes = Router::new()
         .route("/healthz", get(healthz))
         .route("/api/servers", get(server_list))
+        .route("/api/rooms", get(room_list))
+        .route("/api/rooms/{room_id}/map", get(map_get).put(map_put))
+        .route("/api/rooms/{room_id}/telemetry", get(telemetry_get))
         .route("/ws/audio/{room_id}", get(audio_ws))
         .route("/", get(web_index))
         .route("/manifest.webmanifest", get(web_manifest))
@@ -102,31 +168,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/service-worker.js", get(web_service_worker))
         .route("/_app/{*path}", get(web_asset));
 
-    let redis_enabled = std::env::var("ECORUN_REDIS_ENABLED")
-        .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
-        .unwrap_or(false);
-    if redis_enabled {
-        let redis_url =
-            std::env::var("ECORUN_REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379/".into());
-        let prefix =
-            std::env::var("ECORUN_REDIS_NAMESPACE").unwrap_or_else(|_| "ecorun-logger".into());
-        let client = redis::Client::open(redis_url).context("invalid ECORUN_REDIS_URL")?;
-        let (layer, io) = SocketIo::builder()
-            .with_state(socket_state)
-            .with_adapter::<RedisAdapter<_>>(
-                RedisAdapterCtr::new_with_redis_config(
-                    &client,
-                    RedisAdapterConfig::new().with_prefix(prefix),
-                )
-                .await
-                .context("failed to configure Socket.IO Redis adapter")?,
-            )
-            .build_layer();
-        serve_app(routes, state, layer, io, bind).await?;
-    } else {
-        let (layer, io) = SocketIo::builder().with_state(socket_state).build_layer();
-        serve_app(routes, state, layer, io, bind).await?;
-    }
+    let (layer, io) = SocketIo::builder().with_state(socket_state).build_layer();
+    serve_app(routes, state, layer, io, bind).await?;
     Ok(())
 }
 
@@ -201,6 +244,114 @@ async fn server_list() -> impl IntoResponse {
     ([(header::CACHE_CONTROL, "no-store")], axum::Json(servers))
 }
 
+async fn room_list(State(state): State<AppState>) -> impl IntoResponse {
+    match state.rooms_config.list() {
+        Ok(rooms) => ([(header::CACHE_CONTROL, "no-store")], axum::Json(rooms)).into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            axum::Json(serde_json::json!({"error":error.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+fn request_authorized(headers: &HeaderMap, rooms: &RoomStore, room_id: &str) -> bool {
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(|key| rooms.authenticate(room_id, key).unwrap_or(false))
+        .unwrap_or(false)
+}
+
+async fn map_get(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(room_id): Path<String>,
+) -> impl IntoResponse {
+    if !request_authorized(&headers, &state.rooms_config, &room_id) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    if !state.rooms_config.exists(&room_id).unwrap_or(false) {
+        return (
+            StatusCode::FORBIDDEN,
+            axum::Json(serde_json::json!({"error":"room_not_allowed"})),
+        )
+            .into_response();
+    }
+    match state.map.get_map(&room_id) {
+        Ok(map) => ([(header::CACHE_CONTROL, "no-store")], axum::Json(map)).into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            axum::Json(serde_json::json!({"error":error.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+async fn map_put(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(room_id): Path<String>,
+    axum::Json(map): axum::Json<map::MapConfig>,
+) -> impl IntoResponse {
+    if !request_authorized(&headers, &state.rooms_config, &room_id) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    if !state.rooms_config.exists(&room_id).unwrap_or(false) {
+        return (
+            StatusCode::FORBIDDEN,
+            axum::Json(serde_json::json!({"error":"room_not_allowed"})),
+        )
+            .into_response();
+    }
+    if !map.center_lat.is_finite()
+        || !map.center_lon.is_finite()
+        || !map.zoom.is_finite()
+        || map.zoom < 0.0
+        || map.zoom > 24.0
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({"error":"invalid_map_view"})),
+        )
+            .into_response();
+    }
+    match state.map.save_map(&room_id, &map) {
+        Ok(()) => axum::Json(map).into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            axum::Json(serde_json::json!({"error":error.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+async fn telemetry_get(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(room_id): Path<String>,
+) -> impl IntoResponse {
+    if !request_authorized(&headers, &state.rooms_config, &room_id) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    if !state.rooms_config.exists(&room_id).unwrap_or(false) {
+        return (
+            StatusCode::FORBIDDEN,
+            axum::Json(serde_json::json!({"error":"room_not_allowed"})),
+        )
+            .into_response();
+    }
+    match state.map.recent_telemetry(&room_id, 100) {
+        Ok(events) => ([(header::CACHE_CONTROL, "no-store")], axum::Json(events)).into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            axum::Json(serde_json::json!({"error":error.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
 async fn web_index() -> Response {
     serve_web_file("web/build/index.html", "text/html; charset=utf-8").await
 }
@@ -259,7 +410,10 @@ async fn audio_ws(
     State(state): State<AppState>,
     Path(room_id): Path<String>,
 ) -> impl IntoResponse {
-    if room_id.is_empty() || room_id.len() > 64 {
+    if room_id.is_empty()
+        || room_id.len() > 64
+        || !state.rooms_config.exists(&room_id).unwrap_or(false)
+    {
         return StatusCode::BAD_REQUEST.into_response();
     }
     ws.on_upgrade(move |socket| handle_audio_socket(socket, state, room_id))
@@ -270,7 +424,8 @@ async fn handle_audio_socket(mut socket: WebSocket, state: AppState, initial_roo
     let session_id = state.rooms.new_session_id();
     let (audio_tx, mut audio_rx) = mpsc::channel::<Vec<u8>>(AUDIO_QUEUE_CAPACITY);
     let (control_tx, mut control_rx) = mpsc::channel::<String>(CONTROL_QUEUE_CAPACITY);
-    let mut room_id: Option<String> = Some(initial_room_id.clone());
+    let room_id: Option<String> = Some(initial_room_id.clone());
+    let mut receive_audio = true;
     let mut codec = match OpusCodec::new() {
         Ok(codec) => codec,
         Err(error) => {
@@ -314,6 +469,7 @@ async fn handle_audio_socket(mut socket: WebSocket, state: AppState, initial_roo
             session_id,
             audio_tx.clone(),
             control_tx.clone(),
+            false,
         )
         .await;
     let participants = state.rooms.participant_states(&initial_room_id).await;
@@ -330,7 +486,7 @@ async fn handle_audio_socket(mut socket: WebSocket, state: AppState, initial_roo
     loop {
         tokio::select! {
             outbound = audio_rx.recv() => match outbound {
-                Some(packet) => if socket.send(Message::Binary(packet.into())).await.is_err() { break },
+                Some(packet) => if receive_audio && socket.send(Message::Binary(packet.into())).await.is_err() { break },
                 None => break,
             },
             event = control_rx.recv() => match event {
@@ -358,44 +514,27 @@ async fn handle_audio_socket(mut socket: WebSocket, state: AppState, initial_roo
                         }
                     }
                     Some(Ok(Message::Text(text))) => match serde_json::from_str::<ControlEvent>(&text) {
-                        Ok(ControlEvent::Hello { client_id, protocol }) => {
-                            info!(%session_id, ?client_id, ?protocol, "client hello");
-                        }
-                        Ok(ControlEvent::RoomJoin { room_id: requested }) => {
-                            if requested.is_empty() || requested.len() > 64 {
-                                let _ = control_tx.try_send(serde_json::to_string(&ServerEvent::Error {
-                                    code: "invalid_room", message: "room_id must be 1..64 characters",
-                                }).unwrap());
-                                continue;
+                        Ok(ControlEvent::Hello { client_id, protocol, audio_formats, role, audio_config, bitrate, mixer, forward_to_logger }) => {
+                            receive_audio = audio_formats
+                                .map_or(true, |formats| formats.iter().any(AudioFormat::is_server_format));
+                            if let Some(room) = room_id.as_deref() {
+                                let is_logger = role.as_deref() == Some("logger");
+                                if let Some(config) = audio_config.as_ref() {
+                                    if !config.is_server_format() {
+                                        let _ = control_tx.try_send(serde_json::to_string(&ServerEvent::Error { code: "unsupported_audio_config", message: "server audio format is 8 kHz mono 60 ms" }).unwrap());
+                                    }
+                                }
+                                if let Some(bitrate) = bitrate {
+                                    if !(4_000..=32_000).contains(&bitrate) {
+                                        let _ = control_tx.try_send(serde_json::to_string(&ServerEvent::Error { code: "invalid_bitrate", message: "bitrate must be 4000..32000 bps" }).unwrap());
+                                    } else if let Err(error) = codec.set_bitrate(bitrate) {
+                                        warn!(%session_id, %error, "failed to apply requested Opus bitrate");
+                                    }
+                                }
+                                state.rooms.set_logger(room, session_id, is_logger).await;
+                                state.rooms.set_receive_audio(room, session_id, forward_to_logger.unwrap_or(receive_audio)).await;
                             }
-                            let previous = room_id.replace(requested.clone());
-                            if let Some(previous) = previous.as_deref() {
-                                state.rooms.leave(&previous, session_id).await;
-                                let participants = state.rooms.participant_states(previous).await;
-                                let state_event = serde_json::to_string(&ServerEvent::RoomState {
-                                    room_id: previous,
-                                    participants,
-                                })
-                                .unwrap();
-                                state.rooms.broadcast_control(previous, state_event).await;
-                            }
-                            state.rooms.join(&requested, session_id, audio_tx.clone(), control_tx.clone()).await;
-                            let participants = state.rooms.participant_states(&requested).await;
-                            let state_event = serde_json::to_string(&ServerEvent::RoomState {
-                                room_id: &requested, participants,
-                            }).unwrap();
-                            state.rooms.broadcast_control(&requested, state_event).await;
-                        }
-                        Ok(ControlEvent::RoomLeave) => {
-                            if let Some(previous) = room_id.take() {
-                                state.rooms.leave(&previous, session_id).await;
-                                let participants = state.rooms.participant_states(&previous).await;
-                                let state_event = serde_json::to_string(&ServerEvent::RoomState {
-                                    room_id: &previous,
-                                    participants,
-                                }).unwrap();
-                                state.rooms.broadcast_control(&previous, state_event).await;
-                            }
+                            info!(%session_id, ?client_id, ?protocol, ?role, ?mixer, ?bitrate, receive_audio, ?forward_to_logger, "client hello");
                         }
                         Ok(ControlEvent::AudioMute { muted }) => {
                             if let Some(room) = room_id.as_deref() {
@@ -416,6 +555,49 @@ async fn handle_audio_socket(mut socket: WebSocket, state: AppState, initial_roo
                                         room_id: room, participants,
                                     }).unwrap();
                                     state.rooms.broadcast_control(room, state_event).await;
+                                }
+                            }
+                        }
+                        Ok(ControlEvent::PodiumMeta { meta }) => {
+                            if let Some(room) = room_id.as_deref() {
+                                let persisted = serde_json::json!({"meta": meta});
+                                if let Err(error) = state.map.append_telemetry(room, "podium.meta", None, &persisted) {
+                                    warn!(%error, "failed to persist Podium metadata");
+                                }
+                                let meta = persisted.get("meta").and_then(|value| value.as_array()).cloned().unwrap_or_default();
+                                if let Err(error) = state.podium.meta(room, meta).await {
+                                    let _ = control_tx.try_send(serde_json::to_string(&ServerEvent::Error {
+                                        code: error.code(), message: error.message(),
+                                    }).unwrap());
+                                }
+                            }
+                        }
+                        Ok(ControlEvent::PodiumSamples { samples }) => {
+                            if let Some(room) = room_id.as_deref() {
+                                let persisted = serde_json::json!({"samples": samples});
+                                if let Err(error) = state.map.append_telemetry(room, "podium", None, &persisted) {
+                                    warn!(%error, "failed to persist Podium telemetry");
+                                } else {
+                                    state.rooms.broadcast_control(room, serde_json::json!({"type":"telemetry","source":"podium","data":persisted}).to_string()).await;
+                                }
+                                let samples = persisted.get("samples").and_then(|value| value.as_array()).cloned().unwrap_or_default().into_iter().map(|value| value.as_array().cloned().unwrap_or_default()).collect();
+                                if let Err(error) = state.podium.samples(room, samples).await {
+                                    let _ = control_tx.try_send(serde_json::to_string(&ServerEvent::Error {
+                                        code: error.code(), message: error.message(),
+                                    }).unwrap());
+                                }
+                            }
+                        }
+                        Ok(ControlEvent::Telemetry { source, timestamp, data }) => {
+                            if let Some(room) = room_id.as_deref() {
+                                let payload = data.unwrap_or_else(|| serde_json::json!({}));
+                                let source = source.unwrap_or_else(|| "logger".into());
+                                match state.map.append_telemetry(room, &source, timestamp.as_deref(), &payload) {
+                                    Ok(id) => {
+                                        let event = serde_json::json!({"type":"telemetry","id":id,"source":source,"timestamp":timestamp,"data":payload});
+                                        state.rooms.broadcast_control(room, event.to_string()).await;
+                                    }
+                                    Err(error) => warn!(%error, "failed to persist telemetry"),
                                 }
                             }
                         }

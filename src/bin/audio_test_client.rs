@@ -69,12 +69,6 @@ async fn main() -> Result<()> {
         "unexpected audio config event: {config}"
     );
     ws.send(Message::Text(
-        serde_json::json!({"type":"room.join", "room_id":room})
-            .to_string()
-            .into(),
-    ))
-    .await?;
-    ws.send(Message::Text(
         serde_json::json!({"type":"audio.ptt", "active":true})
             .to_string()
             .into(),

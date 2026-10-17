@@ -15,7 +15,6 @@ const SAMPLE_RATE: u32 = 8_000;
 const FRAME_SAMPLES: usize = 480;
 const MAX_PACKET_SIZE: usize = 1_275;
 const DEFAULT_URL: &str = "ws://127.0.0.1:3000/ws/audio/main";
-const ROOM: &str = "phase1-test";
 
 type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
@@ -71,21 +70,6 @@ impl Client {
             bail!("{}: expected event {event_type:?}, got {event}", self.name);
         }
         Ok(event)
-    }
-
-    async fn join_room(&mut self, room: &str) -> Result<()> {
-        self.ws
-            .send(Message::Text(
-                serde_json::json!({"type": "room.join", "room_id": room})
-                    .to_string()
-                    .into(),
-            ))
-            .await?;
-        let event = self.expect_event("room.state").await?;
-        if event["room_id"].as_str() != Some(room) {
-            bail!("{}: joined room mismatch: {event}", self.name);
-        }
-        Ok(())
     }
 
     async fn set_ptt(&mut self, active: bool) -> Result<()> {
@@ -178,8 +162,6 @@ async fn main() -> Result<()> {
     sender.expect_event("room.state").await?;
     receiver.expect_event("room.state").await?;
 
-    sender.join_room(ROOM).await?;
-    receiver.join_room(ROOM).await?;
     sender.set_ptt(true).await?;
 
     let expected = make_test_pcm();
@@ -200,7 +182,7 @@ async fn main() -> Result<()> {
     }
 
     println!(
-        "PASS: hello/config, room.join, Opus 8 kHz mono 60 ms, and room fan-out verified (packet={} bytes, decoded={} samples, RMS={output_rms:.1})",
+        "PASS: hello/config, initial room, Opus 8 kHz mono 60 ms, and room fan-out verified (packet={} bytes, decoded={} samples, RMS={output_rms:.1})",
         packet_len,
         received.len()
     );
