@@ -28,4 +28,4 @@ USER nonroot
 COPY --from=client-build /app/client/build/ ./web/build/
 COPY --from=server-build /usr/src/app/target/release/ecorun-logger-server .
 
-CMD ["ecorun-logger-server"]
+CMD ["./ecorun-logger-server"]

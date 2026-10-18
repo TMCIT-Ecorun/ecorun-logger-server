@@ -1,0 +1,12 @@
+services:
+  server:
+    image: gchr.io/tmcit-ecorun/ecorun-logger-server:latest
+    ports:
+      - "3000:3000"
+    env_file:
+      - .env
+    init: true
+    environment:
+      - DATABASE_URL=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@${POSTGRES_HOST:-db}:${POSTGRES_PO
+    env_file:
+      - .env
