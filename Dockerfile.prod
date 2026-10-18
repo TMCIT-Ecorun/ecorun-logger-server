@@ -1,0 +1,31 @@
+FROM ghcr.io/pnpm/pnpm:12 AS client-build
+
+WORKDIR /app/client
+COPY ./web/ .
+
+RUN pnpm runtime set node 24 -g && \
+    pnpm install --frozen-lockfile && \
+    pnpm build
+
+FROM rust:slim AS server-build
+
+WORKDIR /usr/src/app
+COPY Cargo.lock Cargo.toml .
+COPY src ./src
+
+RUN apt update && \
+    apt upgrade -y libopus-dev build-essential cmake && \
+    apt clean
+RUN cargo install --path .
+
+FROM debian:13-slim AS prod
+
+RUN useradd nonroot
+RUN apt update && apt install libopus0
+RUN mkdir -p ./web/build/ && chown nonroot:nonroot ./web/build/
+
+USER nonroot
+COPY --from=client-build /app/client/build/ ./web/build/
+COPY --from=server-build /usr/src/app/target/release/ecorun-logger-server .
+
+CMD ["ecorun-logger-server"]
