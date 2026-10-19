@@ -287,6 +287,7 @@
         receivedPacketCount++;
         await decodePacket(bytes);
       });
+      ws.on('telemetry', (event) => handleEvent({ ...event, type: 'telemetry' }));
       ws.on('error', (event) => handleEvent({ type: 'error', ...event }));
     } catch (error) { status = 'disconnected'; errorMessage = String(error); }
   }
@@ -303,7 +304,7 @@
       telemetry = [item, ...telemetry].slice(0, 12);
       const position = findPosition(item.data);
       if (position) {
-        const session = String(item.data.session_id ?? item.data.id ?? item.source);
+        const session = String(event.session_id ?? item.data.session_id ?? item.data.id ?? item.source);
         loggerPositions = [...loggerPositions.filter((entry) => entry.session !== session), { session, ...position, data: item.data }];
         renderMap();
       }
@@ -312,8 +313,9 @@
   }
 
   function findPosition(data: Record<string, unknown>) {
-    const lat = Number(data.lat ?? data.latitude ?? data.gps_lat ?? data.gnss_lat);
-    const lon = Number(data.lon ?? data.lng ?? data.longitude ?? data.gps_lon ?? data.gnss_lon);
+    // Loggers use Podium's channel names (Latitude/Longitude).
+    const lat = Number(data.lat ?? data.latitude ?? data.Latitude ?? data.gps_lat ?? data.gnss_lat);
+    const lon = Number(data.lon ?? data.lng ?? data.longitude ?? data.Longitude ?? data.gps_lon ?? data.gnss_lon);
     return Number.isFinite(lat) && Number.isFinite(lon) && Math.abs(lat) <= 90 && Math.abs(lon) <= 180 ? { lat, lon } : null;
   }
 

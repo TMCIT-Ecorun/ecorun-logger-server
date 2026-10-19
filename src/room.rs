@@ -15,7 +15,7 @@ struct Participant {
     control_tx: ControlSender,
     muted: bool,
     ptt: bool,
-    pub is_logger: bool,
+    is_logger: bool,
     receive_audio: bool,
 }
 
@@ -164,6 +164,15 @@ impl RoomManager {
             {
                 let _ = participant.audio_tx.try_send(packet.clone());
             }
+        }
+    }
+    pub async fn broadcast_control_to_non_loggers(&self, room_id: &str, event: String) {
+        let rooms = self.rooms.read().await;
+        let Some(room) = rooms.get(room_id) else {
+            return;
+        };
+        for participant in room.values().filter(|participant| !participant.is_logger) {
+            let _ = participant.control_tx.try_send(event.clone());
         }
     }
     pub async fn broadcast_control(&self, room_id: &str, event: String) {
