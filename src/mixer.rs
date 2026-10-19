@@ -27,7 +27,9 @@ pub const MIX_FRAME_MS: u16 = 120;
 pub const MIX_FRAME_SAMPLES: usize = SAMPLE_RATE as usize * MIX_FRAME_MS as usize / 1000;
 pub const DEFAULT_BITRATE: i32 = 6_000;
 /// Latency cap per source: older audio is dropped instead of delaying speech.
-const MAX_BUFFER_SAMPLES: usize = MIX_FRAME_SAMPLES * 4;
+/// A logger on LTE delivers its voice in bursts of half a second or more, so
+/// the cap is about 2 s; smoothly arriving sources never come near it.
+const MAX_BUFFER_SAMPLES: usize = MIX_FRAME_SAMPLES * 16;
 /// A source that sent nothing for this long is forgotten (its decoder freed).
 const SOURCE_IDLE: Duration = Duration::from_secs(3);
 /// Longest Opus packet (120 ms) at our sample rate.
@@ -336,6 +338,21 @@ mod tests {
             hub.push("browsers-only", SourceId::Socket("a".into()), &packet);
         }
         assert!(hub.rooms.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_burst_from_a_logger_on_lte_is_not_dropped() {
+        let hub = MixHub::new(DEFAULT_BITRATE);
+        let (tx, mut rx) = mpsc::channel(64);
+        hub.add_listener("main", 7, tx);
+        // 1.2 s of 120 ms packets arriving at once, as one modem send delivers them.
+        for packet in tone_packets(8_000, 120, 10, 300.0) {
+            hub.push("main", SourceId::Ws(9), &packet);
+        }
+        for _ in 0..12 {
+            hub.tick();
+        }
+        assert_eq!(drain(&mut rx).len(), 10);
     }
 
     #[test]
