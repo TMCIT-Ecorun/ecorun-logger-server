@@ -24,6 +24,7 @@ mod map;
 mod podium;
 mod room;
 mod socketio_api;
+mod telemetry;
 
 use audio::{AudioCodec, OpusCodec};
 use config::RoomStore;
@@ -41,6 +42,7 @@ struct AppState {
     rooms: Arc<RoomManager>,
     podium: Arc<PodiumHub>,
     map: Arc<map::MapStore>,
+    io: SocketIo,
 }
 
 #[derive(Debug, Deserialize)]
@@ -147,11 +149,13 @@ async fn main() -> anyhow::Result<()> {
     let map = Arc::new(map::MapStore::open(&db_path).context("failed to open SQLite database")?);
     let socket_state = socketio_api::SocketState::new(map.clone(), rooms_config.clone());
     let podium = Arc::new(PodiumHub::from_env(rooms.clone(), rooms_config.clone()));
+    let (layer, io) = SocketIo::builder().with_state(socket_state).build_layer();
     let state = AppState {
         rooms_config,
         podium,
         map: map.clone(),
         rooms,
+        io: io.clone(),
     };
     let routes = Router::new()
         .route("/healthz", get(healthz))
@@ -168,7 +172,6 @@ async fn main() -> anyhow::Result<()> {
         .route("/service-worker.js", get(web_service_worker))
         .route("/_app/{*path}", get(web_asset));
 
-    let (layer, io) = SocketIo::builder().with_state(socket_state).build_layer();
     serve_app(routes, state, layer, io, bind).await?;
     Ok(())
 }
@@ -420,6 +423,30 @@ async fn audio_ws(
         .into_response()
 }
 
+/// Send a telemetry event to the room's web clients (Socket.IO) and to its
+/// non-logger `/ws/audio` clients. Loggers never get it back: on LTE every
+/// downlink byte competes with their own telemetry.
+async fn publish_telemetry(state: &AppState, room: &str, event: serde_json::Value) {
+    if let Some(namespace) = state.io.of(format!("/{room}")) {
+        if let Err(error) = namespace.emit("telemetry", &event).await {
+            warn!(%error, %room, "failed to send telemetry to web clients");
+        }
+    }
+    state
+        .rooms
+        .broadcast_control_to_non_loggers(room, event.to_string())
+        .await;
+}
+
+/// Anything sending Podium data is a logger, even when its hello carried no
+/// `role` (EcoLogger V2 up to 2026-10 does not send one).
+async fn mark_logger(state: &AppState, room: &str, session_id: SessionId, is_logger: &mut bool) {
+    if !*is_logger {
+        *is_logger = true;
+        state.rooms.set_logger(room, session_id, true).await;
+    }
+}
+
 async fn handle_audio_socket(mut socket: WebSocket, state: AppState, initial_room_id: String) {
     let session_id = state.rooms.new_session_id();
     let (audio_tx, mut audio_rx) = mpsc::channel::<Vec<u8>>(AUDIO_QUEUE_CAPACITY);
@@ -444,6 +471,10 @@ async fn handle_audio_socket(mut socket: WebSocket, state: AppState, initial_roo
         }
     };
     let mut pending_pcm: Vec<i16> = Vec::with_capacity(audio::FRAME_SAMPLES * 2);
+    // Channel names from this logger's latest `podium.meta`, used to label
+    // its sample rows for the web map.
+    let mut podium_names: Vec<String> = Vec::new();
+    let mut is_logger = false;
 
     let hello = serde_json::to_string(&ServerEvent::Hello {
         protocol: 2,
@@ -518,7 +549,7 @@ async fn handle_audio_socket(mut socket: WebSocket, state: AppState, initial_roo
                             receive_audio = audio_formats
                                 .map_or(true, |formats| formats.iter().any(AudioFormat::is_server_format));
                             if let Some(room) = room_id.as_deref() {
-                                let is_logger = role.as_deref() == Some("logger");
+                                is_logger = role.as_deref() == Some("logger");
                                 if let Some(config) = audio_config.as_ref() {
                                     if !config.is_server_format() {
                                         let _ = control_tx.try_send(serde_json::to_string(&ServerEvent::Error { code: "unsupported_audio_config", message: "server audio format is 8 kHz mono 60 ms" }).unwrap());
@@ -560,6 +591,8 @@ async fn handle_audio_socket(mut socket: WebSocket, state: AppState, initial_roo
                         }
                         Ok(ControlEvent::PodiumMeta { meta }) => {
                             if let Some(room) = room_id.as_deref() {
+                                mark_logger(&state, room, session_id, &mut is_logger).await;
+                                podium_names = telemetry::channel_names(&meta);
                                 let persisted = serde_json::json!({"meta": meta});
                                 if let Err(error) = state.map.append_telemetry(room, "podium.meta", None, &persisted) {
                                     warn!(%error, "failed to persist Podium metadata");
@@ -574,11 +607,18 @@ async fn handle_audio_socket(mut socket: WebSocket, state: AppState, initial_roo
                         }
                         Ok(ControlEvent::PodiumSamples { samples }) => {
                             if let Some(room) = room_id.as_deref() {
+                                mark_logger(&state, room, session_id, &mut is_logger).await;
+                                // Only the newest row: the map needs the position, not every 100 ms sample.
+                                let latest = samples.last().and_then(|row| telemetry::named_row(&podium_names, row));
                                 let persisted = serde_json::json!({"samples": samples});
-                                if let Err(error) = state.map.append_telemetry(room, "podium", None, &persisted) {
-                                    warn!(%error, "failed to persist Podium telemetry");
-                                } else {
-                                    state.rooms.broadcast_control(room, serde_json::json!({"type":"telemetry","source":"podium","data":persisted}).to_string()).await;
+                                match state.map.append_telemetry(room, "podium", None, &persisted) {
+                                    Err(error) => warn!(%error, "failed to persist Podium telemetry"),
+                                    Ok(id) => {
+                                        if let Some(data) = latest {
+                                            let event = serde_json::json!({"type":"telemetry","id":id,"source":"logger","session_id":session_id,"data":data});
+                                            publish_telemetry(&state, room, event).await;
+                                        }
+                                    }
                                 }
                                 let samples = persisted.get("samples").and_then(|value| value.as_array()).cloned().unwrap_or_default().into_iter().map(|value| value.as_array().cloned().unwrap_or_default()).collect();
                                 if let Err(error) = state.podium.samples(room, samples).await {
@@ -594,8 +634,8 @@ async fn handle_audio_socket(mut socket: WebSocket, state: AppState, initial_roo
                                 let source = source.unwrap_or_else(|| "logger".into());
                                 match state.map.append_telemetry(room, &source, timestamp.as_deref(), &payload) {
                                     Ok(id) => {
-                                        let event = serde_json::json!({"type":"telemetry","id":id,"source":source,"timestamp":timestamp,"data":payload});
-                                        state.rooms.broadcast_control(room, event.to_string()).await;
+                                        let event = serde_json::json!({"type":"telemetry","id":id,"source":source,"session_id":session_id,"timestamp":timestamp,"data":payload});
+                                        publish_telemetry(&state, room, event).await;
                                     }
                                     Err(error) => warn!(%error, "failed to persist telemetry"),
                                 }
