@@ -154,6 +154,8 @@ impl RoomManager {
             .and_then(|room| room.get(&session_id))
             .is_some_and(|participant| participant.ptt && !participant.muted)
     }
+    /// The caller checks `is_talking` when the audio arrives: frames are paced
+    /// out later and the tail of a sentence may go out after PTT went off.
     pub async fn broadcast_audio(&self, room_id: &str, sender: SessionId, packet: Vec<u8>) {
         let rooms = self.rooms.read().await;
         let Some(room) = rooms.get(room_id) else {
@@ -162,9 +164,6 @@ impl RoomManager {
         let Some(source) = room.get(&sender) else {
             return;
         };
-        if source.muted || !source.ptt {
-            return;
-        }
         for (&session_id, participant) in room {
             if session_id != sender
                 && participant.receive_audio

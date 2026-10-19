@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Duration};
+use std::{collections::VecDeque, sync::Arc, time::Duration};
 
 use anyhow::Context;
 use axum::{
@@ -14,7 +14,11 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use socketioxide::{adapter::Adapter, layer::SocketIoLayer, SocketIo};
 use socketioxide_core::adapter::DefinedAdapter;
-use tokio::{net::TcpListener, sync::mpsc, time::timeout};
+use tokio::{
+    net::TcpListener,
+    sync::mpsc,
+    time::{interval, timeout, MissedTickBehavior},
+};
 use tracing::{info, warn};
 
 mod admin;
@@ -36,6 +40,10 @@ use room::{RoomManager, SessionId};
 const DEFAULT_BIND: &str = "0.0.0.0:3000";
 // At 60 ms per packet this bounds queued audio to 180 ms per receiver.
 const AUDIO_QUEUE_CAPACITY: usize = 3;
+// A logger on LTE sends half a second of voice in one burst (one modem send).
+// Its frames are passed on one per 60 ms instead, so the 3-packet receiver
+// queues above do not overflow; this bounds the backlog to about 2 s.
+const PACED_AUDIO_MAX: usize = 34;
 const CONTROL_QUEUE_CAPACITY: usize = 32;
 
 #[derive(Clone)]
@@ -493,6 +501,9 @@ async fn handle_audio_socket(mut socket: WebSocket, state: AppState, initial_roo
     // its sample rows for the web map.
     let mut podium_names: Vec<String> = Vec::new();
     let mut is_logger = false;
+    let mut paced: VecDeque<Vec<u8>> = VecDeque::new();
+    let mut pace = interval(Duration::from_millis(u64::from(audio::FRAME_MS)));
+    pace.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
     let hello = serde_json::to_string(&ServerEvent::Hello {
         protocol: 2,
@@ -541,6 +552,11 @@ async fn handle_audio_socket(mut socket: WebSocket, state: AppState, initial_roo
             Some(packet) = mix_rx.recv() => {
                 if socket.send(Message::Binary(packet.into())).await.is_err() { break }
             },
+            _ = pace.tick(), if !paced.is_empty() => {
+                if let (Some(room), Some(packet)) = (room_id.as_deref(), paced.pop_front()) {
+                    state.rooms.broadcast_audio(room, session_id, packet).await;
+                }
+            },
             event = control_rx.recv() => match event {
                 Some(json) => if socket.send(Message::Text(json.into())).await.is_err() { break },
                 None => {}
@@ -552,14 +568,25 @@ async fn handle_audio_socket(mut socket: WebSocket, state: AppState, initial_roo
                         match codec.decode_and_validate(&packet) {
                             Ok(pcm) => {
                                 if let Some(room) = room_id.as_deref() {
-                                    if state.rooms.is_talking(room, session_id).await {
+                                    // Talking is judged on arrival: paced frames may go out
+                                    // after the speaker's PTT is already off.
+                                    let talking = state.rooms.is_talking(room, session_id).await;
+                                    if talking {
                                         state.mix.push(room, SourceId::Ws(session_id), &packet);
                                     }
                                     pending_pcm.extend_from_slice(&pcm);
                                     while pending_pcm.len() >= audio::FRAME_SAMPLES {
                                         let frame: Vec<i16> = pending_pcm.drain(..audio::FRAME_SAMPLES).collect();
+                                        if !talking {
+                                            continue;
+                                        }
                                         match codec.encode(&frame) {
-                                            Ok(encoded) => state.rooms.broadcast_audio(room, session_id, encoded).await,
+                                            Ok(encoded) => {
+                                                paced.push_back(encoded);
+                                                if paced.len() > PACED_AUDIO_MAX {
+                                                    paced.pop_front();
+                                                }
+                                            }
                                             Err(error) => warn!(%session_id, %error, "audio encode failed"),
                                         }
                                     }
