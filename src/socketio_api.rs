@@ -14,12 +14,14 @@ use tracing::{info, warn};
 
 use crate::config::RoomStore;
 use crate::map::{MapConfig, MapStore};
+use crate::mixer::{MixHub, SourceId};
 
 #[derive(Clone)]
 pub struct SocketState {
     participants: Arc<RwLock<HashMap<String, HashMap<String, Participant>>>>,
     pub map: Arc<MapStore>,
     pub rooms: Arc<RoomStore>,
+    mix: Arc<MixHub>,
 }
 
 #[derive(Deserialize)]
@@ -55,11 +57,12 @@ struct TelemetryPayload {
 }
 
 impl SocketState {
-    pub fn new(map: Arc<MapStore>, rooms: Arc<RoomStore>) -> Self {
+    pub fn new(map: Arc<MapStore>, rooms: Arc<RoomStore>, mix: Arc<MixHub>) -> Self {
         Self {
             participants: Arc::new(RwLock::new(HashMap::new())),
             map,
             rooms,
+            mix,
         }
     }
 }
@@ -209,6 +212,7 @@ async fn on_room<A: Adapter>(
         let id = socket.id.to_string();
         let allowed = state.participants.read().await.get(&room).and_then(|members| members.get(&id)).map(|p| !p.muted && p.ptt).unwrap_or(false);
         if allowed {
+            state.mix.push(&room, SourceId::Socket(id), &packet);
             if let Err(error) = socket.to(room).emit("audio.packet", &packet).await {
                 warn!(%error, "failed to fan out audio packet");
             }

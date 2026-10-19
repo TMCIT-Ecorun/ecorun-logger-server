@@ -146,6 +146,14 @@ impl RoomManager {
         participant.receive_audio = receive_audio;
         true
     }
+    pub async fn is_talking(&self, room_id: &str, session_id: SessionId) -> bool {
+        self.rooms
+            .read()
+            .await
+            .get(room_id)
+            .and_then(|room| room.get(&session_id))
+            .is_some_and(|participant| participant.ptt && !participant.muted)
+    }
     pub async fn broadcast_audio(&self, room_id: &str, sender: SessionId, packet: Vec<u8>) {
         let rooms = self.rooms.read().await;
         let Some(room) = rooms.get(room_id) else {

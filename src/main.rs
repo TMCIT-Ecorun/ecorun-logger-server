@@ -21,12 +21,14 @@ mod admin;
 mod audio;
 mod config;
 mod map;
+mod mixer;
 mod podium;
 mod room;
 mod socketio_api;
 
 use audio::{AudioCodec, OpusCodec};
 use config::RoomStore;
+use mixer::{MixHub, SourceId};
 use podium::PodiumHub;
 use room::{RoomManager, SessionId};
 
@@ -39,6 +41,7 @@ const CONTROL_QUEUE_CAPACITY: usize = 32;
 struct AppState {
     rooms_config: Arc<RoomStore>,
     rooms: Arc<RoomManager>,
+    mix: Arc<MixHub>,
     podium: Arc<PodiumHub>,
     map: Arc<map::MapStore>,
 }
@@ -53,8 +56,10 @@ enum ControlEvent {
         #[serde(default)]
         protocol: Option<u8>,
         /// Audio formats the client can play. Omitted: assume the server's
-        /// format (existing clients). Empty: the client takes no audio, e.g. a
-        /// telemetry-only logger on a metered LTE link.
+        /// format (existing clients). Empty: the client takes no audio.
+        /// Containing the logger mix format (8 kHz mono, 120 ms): the client
+        /// gets one low-bitrate mix of everyone talking, browsers included,
+        /// instead of each talker's packets.
         #[serde(default)]
         audio_formats: Option<Vec<AudioFormat>>,
         #[serde(default)]
@@ -107,6 +112,14 @@ impl AudioFormat {
                 frame_ms: audio::FRAME_MS,
             }
     }
+    fn is_logger_mix_format(&self) -> bool {
+        *self
+            == AudioFormat {
+                sample_rate: audio::SAMPLE_RATE,
+                channels: 1,
+                frame_ms: mixer::MIX_FRAME_MS,
+            }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -145,10 +158,13 @@ async fn main() -> anyhow::Result<()> {
     let rooms = Arc::new(RoomManager::new());
     let rooms_config = Arc::new(RoomStore::open(&db_path).context("failed to open room database")?);
     let map = Arc::new(map::MapStore::open(&db_path).context("failed to open SQLite database")?);
-    let socket_state = socketio_api::SocketState::new(map.clone(), rooms_config.clone());
+    let mix = Arc::new(MixHub::from_env());
+    mix.clone().spawn();
+    let socket_state = socketio_api::SocketState::new(map.clone(), rooms_config.clone(), mix.clone());
     let podium = Arc::new(PodiumHub::from_env(rooms.clone(), rooms_config.clone()));
     let state = AppState {
         rooms_config,
+        mix,
         podium,
         map: map.clone(),
         rooms,
@@ -426,6 +442,8 @@ async fn handle_audio_socket(mut socket: WebSocket, state: AppState, initial_roo
     let (control_tx, mut control_rx) = mpsc::channel::<String>(CONTROL_QUEUE_CAPACITY);
     let room_id: Option<String> = Some(initial_room_id.clone());
     let mut receive_audio = true;
+    // Used once the client's hello asks for the logger mix; it then gets only mix_rx.
+    let (mix_tx, mut mix_rx) = mpsc::channel::<Vec<u8>>(AUDIO_QUEUE_CAPACITY);
     let mut codec = match OpusCodec::new() {
         Ok(codec) => codec,
         Err(error) => {
@@ -489,6 +507,9 @@ async fn handle_audio_socket(mut socket: WebSocket, state: AppState, initial_roo
                 Some(packet) => if receive_audio && socket.send(Message::Binary(packet.into())).await.is_err() { break },
                 None => break,
             },
+            Some(packet) = mix_rx.recv() => {
+                if socket.send(Message::Binary(packet.into())).await.is_err() { break }
+            },
             event = control_rx.recv() => match event {
                 Some(json) => if socket.send(Message::Text(json.into())).await.is_err() { break },
                 None => {}
@@ -500,6 +521,9 @@ async fn handle_audio_socket(mut socket: WebSocket, state: AppState, initial_roo
                         match codec.decode_and_validate(&packet) {
                             Ok(pcm) => {
                                 if let Some(room) = room_id.as_deref() {
+                                    if state.rooms.is_talking(room, session_id).await {
+                                        state.mix.push(room, SourceId::Ws(session_id), &packet);
+                                    }
                                     pending_pcm.extend_from_slice(&pcm);
                                     while pending_pcm.len() >= audio::FRAME_SAMPLES {
                                         let frame: Vec<i16> = pending_pcm.drain(..audio::FRAME_SAMPLES).collect();
@@ -515,8 +539,15 @@ async fn handle_audio_socket(mut socket: WebSocket, state: AppState, initial_roo
                     }
                     Some(Ok(Message::Text(text))) => match serde_json::from_str::<ControlEvent>(&text) {
                         Ok(ControlEvent::Hello { client_id, protocol, audio_formats, role, audio_config, bitrate, mixer, forward_to_logger }) => {
-                            receive_audio = audio_formats
-                                .map_or(true, |formats| formats.iter().any(AudioFormat::is_server_format));
+                            let mix_listener = audio_formats
+                                .as_ref()
+                                .is_some_and(|formats| formats.iter().any(AudioFormat::is_logger_mix_format));
+                            receive_audio = !mix_listener
+                                && audio_formats.map_or(true, |formats| formats.iter().any(AudioFormat::is_server_format));
+                            state.mix.remove_listener(session_id);
+                            if let (true, Some(room)) = (mix_listener, room_id.as_deref()) {
+                                state.mix.add_listener(room, session_id, mix_tx.clone());
+                            }
                             if let Some(room) = room_id.as_deref() {
                                 let is_logger = role.as_deref() == Some("logger");
                                 if let Some(config) = audio_config.as_ref() {
@@ -532,9 +563,11 @@ async fn handle_audio_socket(mut socket: WebSocket, state: AppState, initial_roo
                                     }
                                 }
                                 state.rooms.set_logger(room, session_id, is_logger).await;
-                                state.rooms.set_receive_audio(room, session_id, forward_to_logger.unwrap_or(receive_audio)).await;
+                                // A mix listener gets its audio from the mixer only.
+                                let per_talker = !mix_listener && forward_to_logger.unwrap_or(receive_audio);
+                                state.rooms.set_receive_audio(room, session_id, per_talker).await;
                             }
-                            info!(%session_id, ?client_id, ?protocol, ?role, ?mixer, ?bitrate, receive_audio, ?forward_to_logger, "client hello");
+                            info!(%session_id, ?client_id, ?protocol, ?role, ?mixer, ?bitrate, receive_audio, mix_listener, ?forward_to_logger, "client hello");
                         }
                         Ok(ControlEvent::AudioMute { muted }) => {
                             if let Some(room) = room_id.as_deref() {
@@ -629,5 +662,6 @@ async fn handle_audio_socket(mut socket: WebSocket, state: AppState, initial_roo
         state.rooms.broadcast_control(&room, state_event).await;
     }
     state.rooms.remove(session_id).await;
+    state.mix.remove_listener(session_id);
     info!(%session_id, "audio session disconnected");
 }
