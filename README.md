@@ -169,7 +169,7 @@ Raw WebSocketのprotocol versionは **2**、Socket.IO namespaceのprotocol versi
 
 ### Audio routing
 
-raw WebSocketのloggerはhelloで `{"role":"logger"}` を指定できます。loggerは他のloggerから音声を受け取らず、room内の他ユーザーからの音声だけを受け取ります。`audio_formats: []` なら受信音声を無効にできます。`forward_to_logger: false` でもloggerへの音声転送を停止できます。`audio_config` は現在 `8 kHz / mono / 60 ms` に固定し、`bitrate` は `4000..32000` bps を受け付けます。`mixer` はクライアント指定値を受信してログに残しますが、現行サーバは個別Opus packet fan-out方式です。
+raw WebSocketのloggerはhelloで `{"role":"logger"}` を指定できます。loggerは他のloggerから音声を受け取らず、room内の他ユーザーからの音声だけを受け取ります。`audio_formats: []` なら受信音声を無効にできます。`forward_to_logger: false` でもloggerへの音声転送を停止できます。`audio_config` は現在 `8 kHz / mono / 60 ms` に固定し、`bitrate` は `4000..32000` bps を受け付けます。`mixer` はクライアント指定値を受信してログに残すだけです。ミックスを受けたいときは、下の「ロガー向けミックス」の形式を `audio_formats` に入れます。
 
 ### Phase 4.1 実装
 
@@ -191,7 +191,11 @@ raw WebSocketのloggerはhelloで `{"role":"logger"}` を指定できます。lo
 - `meta` はPodiumの `{"s":{"meta":[...]}}` の中身そのまま。チャンネル構成が変わったら送り直す
 - `samples` の各行はPodiumの `d`（値をmeta順に並べ、最後にビットマスク）。1メッセージ最大50行（ロガーは5行ずつ）。`t` はサーバが振る
 - hello の `audio_formats` はクライアントが再生できる音声形式の一覧（`audio.config` と同じ `sample_rate`・`channels`・`frame_ms`）。
-  サーバの形式を含まないクライアントには通話音声を流さない。ロガーは空の一覧を送る（LTEの通信量対策）。
+  サーバの形式を含まないクライアントには通話音声を流さない。空の一覧なら音声を一切受けない。
+- **ロガー向けミックス**：一覧に `{"sample_rate":8000,"channels":1,"frame_ms":120}` を含めると、同じroomで話している全員
+  （ブラウザのSocket.IO通話も含む）を1本にまとめた音声だけを受ける（自分の声は除く）。120msごとに1パケット、
+  既定6kbps（`ECORUN_LOGGER_AUDIO_BITRATE`）、誰も話していない間は何も送らない。ロガーの送信待ちが詰まったら
+  その音声は捨て、テレメトリを遅らせない。`cargo run --bin logger_mix_test -- http://127.0.0.1:3000 <room> 10 <roomのキー>` で確認できる
   省略したクライアント（既存のロガー・ブラウザ）はこれまでどおり受け取る
 - 中継はroomごとに1本。1つのroomに送るロガーは1台にする
 
