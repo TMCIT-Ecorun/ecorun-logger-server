@@ -307,7 +307,7 @@
     if (event.type === 'room.state') participants = event.participants ?? [];
     if (event.type === 'telemetry') {
       const item = { source: event.source ?? 'unknown', timestamp: event.timestamp, data: event.data ?? {} };
-      telemetry = [item, ...telemetry].slice(0, 12);
+      if (telemetryVisible) telemetry = [item, ...telemetry].slice(0, 12);
       const position = findPosition(item.data);
       if (position) {
         const session = String(event.session_id ?? item.data.session_id ?? item.data.id ?? item.source);
@@ -384,6 +384,7 @@
   }
   function toggleTelemetry() {
     telemetryVisible = !telemetryVisible;
+    if (!telemetryVisible) telemetry = [];
     try { localStorage.setItem('ecorun-telemetry-visible', String(telemetryVisible)); } catch { /* storage may be unavailable */ }
   }
   function deletePlot(id: string) {
