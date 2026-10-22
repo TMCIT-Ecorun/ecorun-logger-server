@@ -21,7 +21,7 @@
   type Participant = { session_id: number | string; muted: boolean; ptt: boolean };
   let participants: Participant[] = [];
   let telemetry: Telemetry[] = [];
-  let telemetryVisible = true;
+  let telemetryVisible = false;
   let errorMessage = '';
   let ptt = false;
   let keyboardPttHeld = false;
@@ -64,7 +64,7 @@
   let mapConfig: MapConfig = { center_lat: 35.6812, center_lon: 139.7671, zoom: 12, plots: [] };
   let mapInstance: any = null;
   let mapLayers: any[] = [];
-  let mapVisible = true;
+  let mapVisible = false;
   let drawingKind: 'point' | 'line' | null = null;
   let drawingCoordinates: [number, number][] = [];
   let mapSaveTimer: ReturnType<typeof setTimeout> | null = null;
@@ -77,6 +77,10 @@
   onMount(() => {
     updateEndpoint();
     try { preventSleep = localStorage.getItem('ecorun-prevent-sleep') !== 'false'; } catch { /* storage may be unavailable */ }
+    try {
+      mapVisible = localStorage.getItem('ecorun-map-visible') === 'true';
+      telemetryVisible = localStorage.getItem('ecorun-telemetry-visible') === 'true';
+    } catch { /* storage may be unavailable */ }
     mediaSessionSupported = 'mediaSession' in navigator;
     updateMediaSession();
     void initializeMap();
@@ -375,7 +379,12 @@
   function startDrawing(kind: 'point' | 'line') { drawingKind = kind; drawingCoordinates = []; renderMap(); }
   function toggleMap() {
     mapVisible = !mapVisible;
+    try { localStorage.setItem('ecorun-map-visible', String(mapVisible)); } catch { /* storage may be unavailable */ }
     if (mapVisible) setTimeout(() => mapInstance?.invalidateSize(), 0);
+  }
+  function toggleTelemetry() {
+    telemetryVisible = !telemetryVisible;
+    try { localStorage.setItem('ecorun-telemetry-visible', String(telemetryVisible)); } catch { /* storage may be unavailable */ }
   }
   function deletePlot(id: string) {
     mapConfig = { ...mapConfig, plots: mapConfig.plots.filter((plot) => plot.id !== id) };
@@ -741,7 +750,7 @@
     </article>
   </section>
   <section class="card map-card"><div class="section-title"><div><p class="eyebrow">LIVE MAP</p><h2>Logger positions & plots</h2></div><div class="map-actions"><button class="secondary compact" aria-expanded={mapVisible} on:click={toggleMap}>{mapVisible ? 'マップを非表示' : 'マップを表示'}</button>{#if mapVisible}<button class="secondary compact" on:click={showMyLocation}>現在地</button><button class="secondary compact" on:click={() => startDrawing('point')}>Add point</button><button class="secondary compact" on:click={() => startDrawing('line')}>Draw line</button>{#if drawingKind}<button class="compact" on:click={finishDrawing}>Finish</button><button class="secondary compact" on:click={() => { drawingKind = null; drawingCoordinates = []; renderMap(); }}>Cancel</button>{/if}{/if}</div></div><div class="map" class:map-hidden={!mapVisible} use:initMap></div>{#if mapVisible}<p class="hint">現在地は「位置情報を1分ごとに送信する」を有効にすると地図上に表示されます。「現在地」で一度だけ取得して地図を移動することもできます。</p>{#if locationError}<p class="error">{locationError}</p>{/if}{#if mapConfig.plots.length}<div class="plot-list"><p class="hint">保存済みの線・ポイント（削除するとルーム内の全員に反映されます）</p>{#each mapConfig.plots as plot, index (plot.id)}<div class="plot-row"><span>{plot.kind === 'line' ? '線' : 'ポイント'} {index + 1}{plot.label ? ` · ${plot.label}` : ''} <small>({plot.coordinates.length}地点)</small></span><button class="secondary compact" aria-label={`${plot.kind === 'line' ? '線' : 'ポイント'} ${index + 1}を削除`} on:click={() => deletePlot(plot.id)}>削除</button></div>{/each}</div>{/if}{/if}</section>
-  <section class="card telemetry"><div class="section-title"><div><p class="eyebrow">TELEMETRY</p><h2>Latest events</h2></div><div class="map-actions"><span class="telemetry-count">{telemetry.length}</span><button class="secondary compact" aria-expanded={telemetryVisible} on:click={() => telemetryVisible = !telemetryVisible}>{telemetryVisible ? 'メトリクスを非表示' : 'メトリクスを表示'}</button></div></div>{#if telemetryVisible}{#if telemetry.length}<div class="events">{#each telemetry as event}<article><strong>{event.source}</strong><time>{event.timestamp ?? 'no timestamp'}</time><pre>{JSON.stringify(event.data, null, 2)}</pre></article>{/each}</div>{:else}<p class="muted">telemetryイベントを待っています</p>{/if}{/if}</section>
+  <section class="card telemetry"><div class="section-title"><div><p class="eyebrow">TELEMETRY</p><h2>Latest events</h2></div><div class="map-actions"><span class="telemetry-count">{telemetry.length}</span><button class="secondary compact" aria-expanded={telemetryVisible} on:click={toggleTelemetry}>{telemetryVisible ? 'メトリクスを非表示' : 'メトリクスを表示'}</button></div></div>{#if telemetryVisible}{#if telemetry.length}<div class="events">{#each telemetry as event}<article><strong>{event.source}</strong><time>{event.timestamp ?? 'no timestamp'}</time><pre>{JSON.stringify(event.data, null, 2)}</pre></article>{/each}</div>{:else}<p class="muted">telemetryイベントを待っています</p>{/if}{/if}</section>
 
   {#if showConnectionModal}<div class="modal-backdrop" role="presentation" on:click={(event) => { if (event.currentTarget === event.target) showConnectionModal = false; }}><section class="modal" role="dialog" aria-modal="true"><div class="section-title"><div><p class="eyebrow">CONNECTION</p><h2>Room & server</h2></div><button class="secondary compact" on:click={() => showConnectionModal = false}>Close</button></div><label>Logger server<select bind:value={selectedServer} on:change={updateEndpoint}>{#each servers as server}<option value={server.id} disabled={!server.available}>{server.name} {server.available ? '' : '(unavailable)'}</option>{/each}</select></label><label>Server URL<input bind:value={endpoint} /></label><label>Room<select bind:value={roomId}>{#each rooms as room}<option value={room.id}>{room.name} ({room.id})</option>{/each}</select></label><label>Room key<input type="password" bind:value={socketToken} autocomplete="off" placeholder="TUIで発行したroom key" /></label><div class="row"><button on:click={joinRoom}>{status === 'connected' ? 'Switch room' : 'Connect'}</button>{#if status === 'connected' || status === 'reconnecting'}<button class="secondary" on:click={disconnect}>Disconnect</button>{/if}</div><label class="setting"><input type="checkbox" checked={preventSleep} on:change={(event) => setPreventSleep((event.currentTarget as HTMLInputElement).checked)} /> 接続中は画面スリープを防止する</label><label class="setting"><input type="checkbox" checked={shareLocation} on:change={(event) => setShareLocation((event.currentTarget as HTMLInputElement).checked)} /> 位置情報を1分ごとに送信する</label><p class="hint">{mediaSessionSupported ? 'Media Session API対応ブラウザです。' : 'Media Session APIは利用できません。'} 位置情報はブラウザの許可が必要です。</p></section></div>{/if}
   {#if showAudioModal}<div class="modal-backdrop" role="presentation" on:click={(event) => { if (event.currentTarget === event.target) showAudioModal = false; }}><section class="modal" role="dialog" aria-modal="true"><div class="section-title"><div><p class="eyebrow">AUDIO</p><h2>Voice settings</h2></div><button class="secondary compact" on:click={() => showAudioModal = false}>Close</button></div><label class="volume">Speaker volume ({Math.round(volume * 100)}%)<input type="range" min="0" max="2" step="0.05" value={volume} on:input={(event) => setVolume(Number((event.currentTarget as HTMLInputElement).value))} /></label><label class="volume">Microphone<select class="device-select" bind:value={selectedInputDevice} on:change={changeInputDevice}><option value="">Default microphone</option>{#each inputDevices as device}<option value={device.deviceId}>{device.label || `Microphone ${device.deviceId.slice(0, 8)}`}</option>{/each}</select></label><label class="volume">Mic volume ({Math.round(micVolume * 100)}%)<input type="range" min="0" max="2" step="0.05" value={micVolume} on:input={(event) => setMicVolume(Number((event.currentTarget as HTMLInputElement).value))} /></label><label class="volume">Mic boost ({micBoost.toFixed(1)}×)<input type="range" min="1" max="4" step="0.25" value={micBoost} on:input={(event) => setMicBoost(Number((event.currentTarget as HTMLInputElement).value))} /></label><label class="volume">Opus sample rate<select bind:value={opusSampleRate} on:change={applyAudioEncoderSettings}>{#each OPUS_SAMPLE_RATES as rate}<option value={rate}>{rate / 1000} kHz</option>{/each}</select></label><label class="volume">Opus frame duration<select bind:value={opusFrameMs} on:change={applyAudioEncoderSettings}>{#each OPUS_FRAME_MS as frameMs}<option value={frameMs}>{frameMs} ms</option>{/each}</select></label><label class="volume">Opus bitrate<select bind:value={opusBitrate} on:change={applyAudioEncoderSettings}>{#each [4000, 6000, 8000, 12000, 16000, 24000, 32000] as bitrate}<option value={bitrate}>{bitrate / 1000} kbps</option>{/each}</select></label><label class="volume">Speaker output{#if outputSelectionSupported}<select bind:value={selectedOutputDevice} on:change={selectOutputDevice}><option value="">Default speaker</option>{#each outputDevices as device}<option value={device.deviceId}>{device.label || `Speaker ${device.deviceId.slice(0, 8)}`}</option>{/each}</select>{:else}<select disabled><option>Switching unsupported</option></select>{/if}</label><p class="hint">Opus設定はWebCodecsの送信側だけに適用します。サーバー側は8 kHz monoへ変換して既存の音声経路を維持します。</p></section></div>{/if}
