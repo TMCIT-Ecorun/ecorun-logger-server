@@ -275,3 +275,25 @@ pnpm run build
 
 詳細な移行計画とPhaseごとの完了条件は [`PLAN.md`](./PLAN.md) を参照してください。
 
+
+### Telemetry replication / browser failover
+
+On the main node set `ECORUN_SERVER_ID=main` and configure `ECORUN_SERVERS` as
+JSON, for example:
+
+```env
+ECORUN_SERVER_ID=main
+ECORUN_SERVERS=[{"id":"main","name":"Primary","url":"https://main.example.org","available":true},{"id":"backup","name":"Backup","url":"https://backup.example.org","available":true}]
+```
+
+The main node connects **outbound** to each available peer using Socket.IO over
+WebSocket (`/socket.io/`, namespace `/{room_id}`). Each node needs the same room
+IDs and Socket.IO room keys, otherwise the peer rejects the connection. Set
+`ECORUN_SERVERS=[]` on receiving backup nodes to prevent additional replication.
+The `ECORUN_SERVER_ID` must match the local entry's `id` to exclude itself.
+Both nodes keep separate SQLite telemetry records. Live telemetry, Podium
+metadata, and full Podium sample batches are forwarded. Replication is
+best-effort: events during outages or full queues are dropped, and existing
+historical records are not synchronized. Replicated events are never forwarded
+again by the receiver. The browser normally uses one connection and races
+available alternative servers against reconnection when its connection fails.

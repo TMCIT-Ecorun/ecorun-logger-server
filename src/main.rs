@@ -27,6 +27,7 @@ mod config;
 mod map;
 mod mixer;
 mod podium;
+mod replication;
 mod room;
 mod socketio_api;
 mod telemetry;
@@ -54,6 +55,7 @@ struct AppState {
     podium: Arc<PodiumHub>,
     map: Arc<map::MapStore>,
     io: SocketIo,
+    replication: replication::Replicator,
 }
 
 #[derive(Debug, Deserialize)]
@@ -170,7 +172,13 @@ async fn main() -> anyhow::Result<()> {
     let map = Arc::new(map::MapStore::open(&db_path).context("failed to open SQLite database")?);
     let mix = Arc::new(MixHub::from_env());
     mix.clone().spawn();
-    let socket_state = socketio_api::SocketState::new(map.clone(), rooms_config.clone(), mix.clone());
+    let replication = replication::Replicator::start(&rooms_config);
+    let socket_state = socketio_api::SocketState::new(
+        map.clone(),
+        rooms_config.clone(),
+        mix.clone(),
+        replication.clone(),
+    );
     let podium = Arc::new(PodiumHub::from_env(rooms.clone(), rooms_config.clone()));
     let (layer, io) = SocketIo::builder().with_state(socket_state).build_layer();
     let state = AppState {
@@ -180,6 +188,7 @@ async fn main() -> anyhow::Result<()> {
         map: map.clone(),
         rooms,
         io: io.clone(),
+        replication: replication.clone(),
     };
     let routes = Router::new()
         .route("/healthz", get(healthz))
@@ -657,6 +666,7 @@ async fn handle_audio_socket(mut socket: WebSocket, state: AppState, initial_roo
                                 if let Err(error) = state.map.append_telemetry(room, "podium.meta", None, &persisted) {
                                     warn!(%error, "failed to persist Podium metadata");
                                 }
+                                state.replication.forward(room, "podium.meta", None, &persisted);
                                 let meta = persisted.get("meta").and_then(|value| value.as_array()).cloned().unwrap_or_default();
                                 if let Err(error) = state.podium.meta(room, meta).await {
                                     let _ = control_tx.try_send(serde_json::to_string(&ServerEvent::Error {
@@ -674,6 +684,7 @@ async fn handle_audio_socket(mut socket: WebSocket, state: AppState, initial_roo
                                 match state.map.append_telemetry(room, "podium", None, &persisted) {
                                     Err(error) => warn!(%error, "failed to persist Podium telemetry"),
                                     Ok(id) => {
+                                        state.replication.forward(room, "podium", None, &persisted);
                                         if let Some(data) = latest {
                                             let event = serde_json::json!({"type":"telemetry","id":id,"source":"logger","session_id":session_id,"data":data});
                                             publish_telemetry(&state, room, event).await;
@@ -695,6 +706,7 @@ async fn handle_audio_socket(mut socket: WebSocket, state: AppState, initial_roo
                                 match state.map.append_telemetry(room, &source, timestamp.as_deref(), &payload) {
                                     Ok(id) => {
                                         let event = serde_json::json!({"type":"telemetry","id":id,"source":source,"session_id":session_id,"timestamp":timestamp,"data":payload});
+                                        state.replication.forward(room, &source, timestamp.as_deref(), &payload);
                                         publish_telemetry(&state, room, event).await;
                                     }
                                     Err(error) => warn!(%error, "failed to persist telemetry"),

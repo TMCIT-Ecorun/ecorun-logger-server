@@ -27,6 +27,10 @@
   let keyboardPttHeld = false;
   let muted = false;
   let ws: Socket | null = null;
+  let failoverSockets: Socket[] = [];
+  let failoverTimer: ReturnType<typeof setTimeout> | null = null;
+  let connectionGeneration = 0;
+  let activeEndpoint = '';
   let audioContext: AudioContext | null = null;
   let mediaStream: MediaStream | null = null;
   let sourceNode: MediaStreamAudioSourceNode | null = null;
@@ -206,6 +210,64 @@
     endpoint = (selected?.url || location.origin).replace(/\/$/, '');
   }
 
+  function serverEndpoints() {
+    return [...new Set([endpoint, ...servers.filter((server) => server.available).map((server) => server.url || location.origin)]
+      .map((url) => url.replace(/\/$/, '')).filter(Boolean))];
+  }
+
+  function stopFailover() {
+    if (failoverTimer) clearTimeout(failoverTimer);
+    failoverTimer = null;
+    for (const candidate of failoverSockets) candidate.disconnect();
+    failoverSockets = [];
+  }
+
+  function scheduleFailover(socket: Socket) {
+    if (failoverTimer || socket !== ws) return;
+    const generation = connectionGeneration;
+    failoverTimer = setTimeout(() => {
+      failoverTimer = null;
+      if (generation !== connectionGeneration || socket !== ws || socket.connected) return;
+      // Keep the original Socket.IO reconnection running while racing other servers.
+      for (const candidate of failoverSockets) candidate.disconnect();
+      failoverSockets = [];
+      for (const url of serverEndpoints().filter((url) => url !== activeEndpoint)) {
+        const candidate = io(`${url}/${encodeURIComponent(roomId.trim() || 'main')}`, {
+          path: '/socket.io/', transports: ['websocket', 'polling'],
+          auth: { token: socketToken }, reconnection: false, timeout: 5000
+        });
+        failoverSockets.push(candidate);
+        candidate.on('connect', () => {
+          if (generation !== connectionGeneration || socket.connected || socket !== ws) {
+            candidate.disconnect();
+            return;
+          }
+          // Promote the already-connected winner; do not open a second connection.
+          socket.disconnect();
+          ws = candidate;
+          activeEndpoint = url;
+          endpoint = url;
+          connectionGeneration++;
+          stopFailoverExcept(candidate);
+          attachPrimaryHandlers(candidate, connectionGeneration);
+          void initializeConnectedSession();
+        });
+      }
+      if (generation === connectionGeneration && !socket.connected) scheduleFailover(socket);
+    }, 1000);
+  }
+
+  function stopFailoverExcept(winner: Socket) {
+    if (failoverTimer) clearTimeout(failoverTimer);
+    failoverTimer = null;
+    for (const candidate of failoverSockets) if (candidate !== winner) candidate.disconnect();
+    failoverSockets = [];
+  }
+
+  function sendTelemetry(payload: object) {
+    if (ws?.connected) ws.emit('telemetry', payload);
+  }
+
   async function refreshServers() {
     try {
       const response = await fetch('/api/servers', { cache: 'no-store' });
@@ -247,45 +309,45 @@
     else if (value.type === 'audio.ptt') ws.emit('audio.ptt', { active: value.active });
   }
 
-  async function connect() {
-    if (ws) disconnect();
+  async function initializeConnectedSession() {
+    status = 'connected';
+    updateMediaSession();
     errorMessage = '';
-    status = 'connecting';
-    updateEndpoint();
-    logBrowserDiagnostics('connect');
-    try {
-      ws = io(`${endpoint}/${encodeURIComponent(roomId.trim() || 'main')}`, {
-        path: '/socket.io/', transports: ['websocket', 'polling'],
-        auth: { token: socketToken },
-        reconnection: true, reconnectionAttempts: Infinity,
-        reconnectionDelay: 500, reconnectionDelayMax: 10000, randomizationFactor: 0.5,
-      });
-      ws.on('connect', async () => {
-        status = 'connected';
-        updateMediaSession();
-        errorMessage = '';
-        sessionId = null; participants = [];
-        await setupDecoder();
-        await setupAudioCapture();
-        if (shareLocation) startLocationUpdates();
-        if (preventSleep) await acquireWakeLock();
-      });
-      ws.on('connect_error', (error) => { status = 'reconnecting'; errorMessage = `Socket.IO接続エラー: ${error.message}`; });
-      ws.on('disconnect', (reason) => {
-        status = 'reconnecting'; stopAudioCapture(); ptt = false; keyboardPttHeld = false;
-        updateMediaSession();
-        void releaseWakeLock();
-        decoder?.close(); decoder = null;
-        if (reason === 'io server disconnect') errorMessage = 'サーバーが接続を終了しました。再接続してください';
-      });
-      ws.on('hello', (event) => handleEvent({ type: 'hello', ...event }));
-      ws.on('audio.config', (event) => handleEvent({ type: 'audio.config', ...event }));
-      ws.on('room.state', (event) => handleEvent({ type: 'room.state', ...event }));
-      ws.on('map.state', (event) => { mapConfig = event; renderMap(); });
-      ws.on('participant.joined', (participant) => updateParticipant(participant));
-      ws.on('participant.updated', (participant) => updateParticipant(participant));
-      ws.on('participant.left', ({ session_id }) => { participants = participants.filter((p) => String(p.session_id) !== String(session_id)); });
-      ws.on('audio.packet', async (packet: ArrayBuffer | Uint8Array | Blob) => {
+    sessionId = null; participants = [];
+    await setupDecoder();
+    await setupAudioCapture();
+    if (shareLocation) startLocationUpdates();
+    if (preventSleep) await acquireWakeLock();
+  }
+
+  function attachPrimaryHandlers(socket: Socket, generation: number) {
+    socket.on('connect', () => {
+      if (generation !== connectionGeneration) return;
+      stopFailover();
+      void initializeConnectedSession();
+    });
+    socket.on('connect_error', (error) => {
+      if (generation !== connectionGeneration) return;
+      status = 'reconnecting'; errorMessage = `Socket.IO接続エラー: ${error.message}`;
+      scheduleFailover(socket);
+    });
+    socket.on('disconnect', (reason) => {
+      if (generation !== connectionGeneration) return;
+      status = 'reconnecting'; stopAudioCapture(); ptt = false; keyboardPttHeld = false;
+      updateMediaSession();
+      void releaseWakeLock();
+      decoder?.close(); decoder = null;
+      if (reason === 'io server disconnect') errorMessage = 'サーバーが接続を終了しました。再接続してください';
+      scheduleFailover(socket);
+    });
+      socket.on('hello', (event) => handleEvent({ type: 'hello', ...event }));
+      socket.on('audio.config', (event) => handleEvent({ type: 'audio.config', ...event }));
+      socket.on('room.state', (event) => handleEvent({ type: 'room.state', ...event }));
+      socket.on('map.state', (event) => { mapConfig = event; renderMap(); });
+      socket.on('participant.joined', (participant) => updateParticipant(participant));
+      socket.on('participant.updated', (participant) => updateParticipant(participant));
+      socket.on('participant.left', ({ session_id }) => { participants = participants.filter((p) => String(p.session_id) !== String(session_id)); });
+      socket.on('audio.packet', async (packet: ArrayBuffer | Uint8Array | Blob) => {
         let bytes: Uint8Array;
         if (packet instanceof Blob) bytes = new Uint8Array(await packet.arrayBuffer());
         else if (packet instanceof ArrayBuffer) bytes = new Uint8Array(packet);
@@ -293,8 +355,28 @@
         receivedPacketCount++;
         await decodePacket(bytes);
       });
-      ws.on('telemetry', (event) => handleEvent({ ...event, type: 'telemetry' }));
-      ws.on('error', (event) => handleEvent({ type: 'error', ...event }));
+      socket.on('telemetry', (event) => { if (generation === connectionGeneration) handleEvent({ ...event, type: 'telemetry' }); });
+      socket.on('error', (event) => handleEvent({ type: 'error', ...event }));
+  }
+
+  async function connect(targetEndpoint?: string) {
+    if (ws) disconnect();
+    errorMessage = '';
+    status = 'connecting';
+    if (!targetEndpoint) updateEndpoint();
+    activeEndpoint = targetEndpoint ?? endpoint;
+    endpoint = activeEndpoint;
+    const generation = ++connectionGeneration;
+    logBrowserDiagnostics('connect');
+    try {
+      const socket = io(`${activeEndpoint}/${encodeURIComponent(roomId.trim() || 'main')}`, {
+        path: '/socket.io/', transports: ['websocket', 'polling'],
+        auth: { token: socketToken },
+        reconnection: true, reconnectionAttempts: Infinity,
+        reconnectionDelay: 500, reconnectionDelayMax: 10000, randomizationFactor: 0.5
+      });
+      ws = socket;
+      attachPrimaryHandlers(socket, generation);
     } catch (error) { status = 'disconnected'; errorMessage = String(error); }
   }
 
@@ -507,8 +589,7 @@
       myPosition = { lat: position.coords.latitude, lon: position.coords.longitude, accuracy: position.coords.accuracy };
       locationError = '';
       renderMap();
-      if (!ws?.connected) return;
-      ws.emit('telemetry', { source: 'web-client', timestamp: new Date(position.timestamp).toISOString(), data: { latitude: position.coords.latitude, longitude: position.coords.longitude, accuracy_m: position.coords.accuracy } });
+      sendTelemetry({ source: 'web-client', timestamp: new Date(position.timestamp).toISOString(), data: { latitude: position.coords.latitude, longitude: position.coords.longitude, accuracy_m: position.coords.accuracy } });
     }, (error) => {
       locationError = `現在地を取得できません: ${error.message}`;
     }, { enableHighAccuracy: false, maximumAge: 30000, timeout: 10000 });
@@ -717,6 +798,10 @@
   }
 
   function disconnect() {
+    connectionGeneration++;
+    if (failoverTimer) clearTimeout(failoverTimer);
+    failoverTimer = null;
+    stopFailover();
     keyboardPttHeld = false; ptt = false; sendControl({ type: 'audio.ptt', active: false }); stopAudioCapture(); stopLocationUpdates(); void releaseWakeLock(); ws?.disconnect(); ws = null; status = 'disconnected'; updateMediaSession();
   }
 

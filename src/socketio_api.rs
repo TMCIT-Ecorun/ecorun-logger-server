@@ -15,6 +15,7 @@ use tracing::{info, warn};
 use crate::config::RoomStore;
 use crate::map::{MapConfig, MapStore};
 use crate::mixer::{MixHub, SourceId};
+use crate::replication::Replicator;
 
 #[derive(Clone)]
 pub struct SocketState {
@@ -22,6 +23,7 @@ pub struct SocketState {
     pub map: Arc<MapStore>,
     pub rooms: Arc<RoomStore>,
     mix: Arc<MixHub>,
+    replication: Replicator,
 }
 
 #[derive(Deserialize)]
@@ -57,12 +59,18 @@ struct TelemetryPayload {
 }
 
 impl SocketState {
-    pub fn new(map: Arc<MapStore>, rooms: Arc<RoomStore>, mix: Arc<MixHub>) -> Self {
+    pub fn new(
+        map: Arc<MapStore>,
+        rooms: Arc<RoomStore>,
+        mix: Arc<MixHub>,
+        replication: Replicator,
+    ) -> Self {
         Self {
             participants: Arc::new(RwLock::new(HashMap::new())),
             map,
             rooms,
             mix,
+            replication,
         }
     }
 }
@@ -250,12 +258,27 @@ async fn on_room<A: Adapter>(
             match state.map.append_telemetry(&room, &source, payload.timestamp.as_deref(), &data) {
                 Ok(id) => {
                     let event = serde_json::json!({"type":"telemetry","id":id,"source":source,"timestamp":payload.timestamp,"data":data});
+                    state.replication.forward(&room, &source, payload.timestamp.as_deref(), &data);
                     let _ = socket.to(room).emit("telemetry", &event).await;
                 }
                 Err(error) => warn!(%error, "failed to persist Socket.IO telemetry"),
             }
         },
     );
+
+    // Dedicated replication event is persisted but never forwarded again.
+    socket.on("telemetry.replica", move |socket: SocketRef<A>, State(state): State<SocketState>, Data(payload): Data<TelemetryPayload>| async move {
+        let room = socket.ns().trim_start_matches('/').to_owned();
+        let source = payload.source.unwrap_or_else(|| "replica".into());
+        let data = payload.data.unwrap_or_else(|| serde_json::json!({}));
+        match state.map.append_telemetry(&room, &source, payload.timestamp.as_deref(), &data) {
+            Ok(id) => {
+                let event = serde_json::json!({"type":"telemetry","id":id,"source":source,"timestamp":payload.timestamp,"data":data});
+                let _ = socket.to(room).emit("telemetry", &event).await;
+            }
+            Err(error) => warn!(%error, "failed to persist replicated telemetry"),
+        }
+    });
 
     socket.on_disconnect(move |socket: SocketRef<A>, _reason: DisconnectReason, State(state): State<SocketState>| async move {
         let room = socket.ns().trim_start_matches('/').to_owned();
