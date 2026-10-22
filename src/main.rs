@@ -104,6 +104,11 @@ enum ControlEvent {
     PodiumSamples {
         samples: Vec<Vec<serde_json::Value>>,
     },
+    /// Settings for the logger in this room, from the pit (Discord bot, call page), and
+    /// the logger's answer with what it now uses. Passed through as is: the pit's goes to
+    /// the loggers only, the logger's to everyone else. Nothing is stored.
+    #[serde(rename = "logger.config")]
+    LoggerConfig { data: serde_json::Value },
     #[serde(rename = "telemetry")]
     Telemetry {
         #[serde(default)]
@@ -791,6 +796,16 @@ async fn handle_audio_socket(mut socket: WebSocket, state: AppState, initial_roo
                                         room_id: room, participants,
                                     }).unwrap();
                                     state.rooms.broadcast_control(room, state_event).await;
+                                }
+                            }
+                        }
+                        Ok(ControlEvent::LoggerConfig { data }) => {
+                            if let Some(room) = room_id.as_deref() {
+                                let event = serde_json::json!({"type":"logger.config","session_id":session_id,"data":data}).to_string();
+                                if is_logger {
+                                    state.rooms.broadcast_control_to_non_loggers(room, event).await;
+                                } else {
+                                    state.rooms.broadcast_control_to_loggers(room, event).await;
                                 }
                             }
                         }
