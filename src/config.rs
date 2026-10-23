@@ -203,14 +203,23 @@ mod discord_tests {
         let connection = Connection::open_in_memory().unwrap();
         connection.execute_batch("CREATE TABLE rooms (id TEXT PRIMARY KEY, name TEXT NOT NULL, socket_key TEXT NOT NULL, podium_key TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP); INSERT INTO rooms (id,name,socket_key) VALUES ('main','Main','secret');").unwrap();
         // Persist a legacy database to a temporary file for RoomStore::open.
-        let path = std::env::temp_dir().join(format!("ecorun-discord-test-{}-{}.sqlite3", std::process::id(), generate_key()));
-        connection.execute("VACUUM main INTO ?1", [path.to_str().unwrap()]).unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "ecorun-discord-test-{}-{}.sqlite3",
+            std::process::id(),
+            generate_key()
+        ));
+        connection
+            .execute("VACUUM main INTO ?1", [path.to_str().unwrap()])
+            .unwrap();
         drop(connection);
         let result = (|| -> anyhow::Result<()> {
             let store = RoomStore::open(&path)?;
             assert!(store.get("main")?.unwrap().discord_channel_id.is_none());
             assert!(store.set_discord_channel("main", Some("123456789"))?);
-            assert_eq!(store.get("main")?.unwrap().discord_channel_id.as_deref(), Some("123456789"));
+            assert_eq!(
+                store.get("main")?.unwrap().discord_channel_id.as_deref(),
+                Some("123456789")
+            );
             assert!(store.set_discord_channel("main", Some("invalid")).is_err());
             assert!(store.set_discord_channel("main", None)?);
             assert!(store.get("main")?.unwrap().discord_channel_id.is_none());

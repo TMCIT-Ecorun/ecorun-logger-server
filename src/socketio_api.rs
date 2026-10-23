@@ -29,6 +29,7 @@ pub struct SocketState {
     cluster: Cluster,
     telemetry_updates: broadcast::Sender<TelemetryEvent>,
     mix: Arc<MixHub>,
+    raw_audio_updates: broadcast::Sender<(String, String, u64, Vec<u8>)>,
 }
 
 #[derive(Deserialize)]
@@ -201,6 +202,7 @@ impl SocketState {
         cluster: Cluster,
         telemetry_updates: broadcast::Sender<TelemetryEvent>,
         mix: Arc<MixHub>,
+        raw_audio_updates: broadcast::Sender<(String, String, u64, Vec<u8>)>,
     ) -> Self {
         Self {
             participants: Arc::new(RwLock::new(HashMap::new())),
@@ -211,6 +213,7 @@ impl SocketState {
             cluster,
             telemetry_updates,
             mix,
+            raw_audio_updates,
         }
     }
 }
@@ -867,6 +870,12 @@ async fn on_room<A: Adapter>(
                     &packet,
                 )
                 .await;
+                let _ = state.raw_audio_updates.send((
+                    room.clone(),
+                    payload.client_id.clone(),
+                    payload.sequence,
+                    packet.clone(),
+                ));
                 state
                     .cluster
                     .publish(state.cluster.event(ClusterKind::Audio {
