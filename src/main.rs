@@ -26,6 +26,7 @@ mod audio;
 mod audio_delivery;
 mod cluster;
 mod config;
+mod discord_ha;
 mod discord_voice;
 mod map;
 mod mixer;
