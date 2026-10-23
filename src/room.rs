@@ -146,40 +146,37 @@ impl RoomManager {
         participant.receive_audio = receive_audio;
         true
     }
-    pub async fn is_talking(&self, room_id: &str, session_id: SessionId) -> bool {
+    pub async fn logger_count(&self, room_id: &str) -> usize {
+        self.rooms.read().await.get(room_id).map_or(0, |room| {
+            room.values().filter(|member| member.is_logger).count()
+        })
+    }
+
+    pub async fn source_can_speak(&self, room_id: &str, session_id: SessionId) -> bool {
         self.rooms
             .read()
             .await
             .get(room_id)
             .and_then(|room| room.get(&session_id))
-            .is_some_and(|participant| participant.ptt && !participant.muted)
+            .is_some_and(|source| !source.muted && source.ptt)
     }
-    /// The caller checks `is_talking` when the audio arrives: frames are paced
-    /// out later and the tail of a sentence may go out after PTT went off.
+
+    pub async fn is_talking(&self, room_id: &str, session_id: SessionId) -> bool {
+        self.source_can_speak(room_id, session_id).await
+    }
+
     pub async fn broadcast_audio(&self, room_id: &str, sender: SessionId, packet: Vec<u8>) {
         let rooms = self.rooms.read().await;
         let Some(room) = rooms.get(room_id) else {
             return;
         };
-        let Some(source) = room.get(&sender) else {
+        let Some(_source) = room.get(&sender) else {
             return;
         };
         for (&session_id, participant) in room {
-            if session_id != sender
-                && participant.receive_audio
-                && (!participant.is_logger || !source.is_logger)
-            {
+            if session_id != sender && participant.receive_audio && !participant.is_logger {
                 let _ = participant.audio_tx.try_send(packet.clone());
             }
-        }
-    }
-    pub async fn broadcast_control_to_non_loggers(&self, room_id: &str, event: String) {
-        let rooms = self.rooms.read().await;
-        let Some(room) = rooms.get(room_id) else {
-            return;
-        };
-        for participant in room.values().filter(|participant| !participant.is_logger) {
-            let _ = participant.control_tx.try_send(event.clone());
         }
     }
     pub async fn broadcast_control(&self, room_id: &str, event: String) {

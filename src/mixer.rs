@@ -87,8 +87,7 @@ impl MixHub {
     /// Run the mix clock until the process exits.
     pub fn spawn(self: Arc<Self>) {
         tokio::spawn(async move {
-            let mut clock =
-                tokio::time::interval(Duration::from_millis(u64::from(MIX_FRAME_MS)));
+            let mut clock = tokio::time::interval(Duration::from_millis(u64::from(MIX_FRAME_MS)));
             clock.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 clock.tick().await;
@@ -122,6 +121,14 @@ impl MixHub {
             room.listeners.remove(&session_id);
         }
         rooms.retain(|_, room| !room.listeners.is_empty() || !room.sources.is_empty());
+    }
+
+    /// Discard buffered audio immediately when a participant stops talking.
+    pub fn remove_source(&self, room_id: &str, source_id: &SourceId) {
+        let mut rooms = self.rooms.lock().unwrap();
+        if let Some(room) = rooms.get_mut(room_id) {
+            room.sources.remove(source_id);
+        }
     }
 
     /// Feed one Opus packet from a talking participant. Ignored when no logger
@@ -278,7 +285,10 @@ mod tests {
         let mut pcm = [0_i16; MAX_DECODED_SAMPLES];
         let samples = decoder.decode(&packets[2], &mut pcm, false).unwrap();
         assert_eq!(samples, MIX_FRAME_SAMPLES);
-        let rms = (pcm[..samples].iter().map(|&s| f64::from(s).powi(2)).sum::<f64>()
+        let rms = (pcm[..samples]
+            .iter()
+            .map(|&s| f64::from(s).powi(2))
+            .sum::<f64>()
             / samples as f64)
             .sqrt();
         assert!(rms > 1_000.0, "mixed tone too quiet: rms={rms}");
@@ -328,7 +338,11 @@ mod tests {
         }
         let packets = drain(&mut rx);
         assert!(!packets.is_empty());
-        assert!(packets.len() <= ticks, "{} packets for {ticks} ticks", packets.len());
+        assert!(
+            packets.len() <= ticks,
+            "{} packets for {ticks} ticks",
+            packets.len()
+        );
     }
 
     #[test]

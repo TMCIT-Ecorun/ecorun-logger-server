@@ -1,12 +1,28 @@
 services:
-  server:
-    image: gchr.io/tmcit-ecorun/ecorun-logger-server:latest
+  logger-a:
+    image: ghcr.io/tmcit-ecorun/ecorun-logger-server:latest
     ports:
-      - "3000:3000"
-    env_file:
-      - .env
-    init: true
+      - "3001:3000"
     environment:
-      - DATABASE_URL=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@${POSTGRES_HOST:-db}:${POSTGRES_PO
-    env_file:
-      - .env
+      ECORUN_BIND: 0.0.0.0:3000
+      ECORUN_SERVERS: '[{"id":"logger-a","name":"Logger A","url":"http://localhost:3001","available":true},{"id":"logger-b","name":"Logger B","url":"http://localhost:3002","available":true}]'
+      ECORUN_TELEMETRY_DIR: /data
+    volumes:
+      - logger_a_data:/data
+    init: true
+
+  logger-b:
+    image: ghcr.io/tmcit-ecorun/ecorun-logger-server:latest
+    ports:
+      - "3002:3000"
+    environment:
+      ECORUN_BIND: 0.0.0.0:3000
+      ECORUN_SERVERS: '[{"id":"logger-a","name":"Logger A","url":"http://localhost:3001","available":true},{"id":"logger-b","name":"Logger B","url":"http://localhost:3002","available":true}]'
+      ECORUN_TELEMETRY_DIR: /data
+    volumes:
+      - logger_b_data:/data
+    init: true
+
+volumes:
+  logger_a_data:
+  logger_b_data:
