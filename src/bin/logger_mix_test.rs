@@ -18,6 +18,8 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 const BROWSER_RATE: u32 = 16_000;
 const BROWSER_FRAME: usize = 960; // 60 ms
 
+const BROWSER_ID: &str = "mix-test-browser";
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let mut args = env::args().skip(1);
@@ -78,6 +80,16 @@ async fn main() -> Result<()> {
             anyhow::ensure!(!text.starts_with("44"), "namespace connect refused: {text}");
         }
     }
+    // Packets are accepted only from the client_id this socket identified as.
+    browser
+        .send(Message::Text(
+            format!(
+                "42{ns},{}",
+                json!(["client.identify", {"client_id": BROWSER_ID}])
+            )
+            .into(),
+        ))
+        .await?;
     browser
         .send(Message::Text(
             format!("42{ns},{}", json!(["audio.ptt", {"active": true}])).into(),
@@ -129,7 +141,8 @@ async fn main() -> Result<()> {
             .send(Message::Text(
                 format!(
                     "451-{ns},{}",
-                    json!(["audio.packet", {"_placeholder": true, "num": 0}])
+                    json!(["audio.packet", {"client_id": BROWSER_ID, "sequence": sent,
+                                             "packet": {"_placeholder": true, "num": 0}}])
                 )
                 .into(),
             ))
