@@ -1,4 +1,4 @@
-use std::{collections::HashMap, path::PathBuf, sync::Arc, time::SystemTime};
+use std::{collections::HashMap, sync::Arc, time::SystemTime};
 
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
@@ -42,7 +42,7 @@ struct SocketAuth {
 
 #[derive(Clone)]
 pub struct TelemetryStore {
-    directory: Arc<PathBuf>,
+    files: Arc<crate::telemetry_files::TelemetryFiles>,
     recent: Arc<RwLock<HashMap<String, Vec<TelemetryEvent>>>>,
 }
 
@@ -80,9 +80,8 @@ impl TelemetryEvent {
 
 impl TelemetryStore {
     pub fn new() -> Self {
-        let directory = std::env::var("ECORUN_TELEMETRY_DIR").unwrap_or_else(|_| "./data".into());
         Self {
-            directory: Arc::new(PathBuf::from(directory)),
+            files: Arc::new(crate::telemetry_files::TelemetryFiles::from_env()),
             recent: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -97,47 +96,8 @@ impl TelemetryStore {
                 entries.drain(..drain);
             }
         }
-        if tokio::fs::create_dir_all(&*self.directory).await.is_err() {
-            warn!("failed to create telemetry directory");
-            return;
-        }
-        let path = self
-            .directory
-            .join(format!("{}.ndjson", safe_room_filename(&event.room_id)));
-        match serde_json::to_vec(&event) {
-            Ok(mut line) => {
-                line.push(b'\n');
-                match tokio::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(path)
-                    .await
-                {
-                    Ok(mut file) => {
-                        use tokio::io::AsyncWriteExt;
-                        if let Err(error) = file.write_all(&line).await {
-                            warn!(%error, "failed to append telemetry");
-                        }
-                    }
-                    Err(error) => warn!(%error, "failed to open telemetry log"),
-                }
-            }
-            Err(error) => warn!(%error, "failed to serialize telemetry"),
-        }
+        self.files.append(&event).await;
     }
-}
-
-fn safe_room_filename(room_id: &str) -> String {
-    room_id
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
 }
 
 #[derive(Clone, Serialize)]
