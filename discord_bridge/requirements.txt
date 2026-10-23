@@ -1,6 +1,0 @@
-discord.py[voice]>=2.5,<3
-discord-ext-voice-recv>=0.5,<1
-python-socketio[asyncio_client]>=5.12,<6
-opuslib>=3.0,<4
-numpy>=1.26,<3
-scipy>=1.12,<2

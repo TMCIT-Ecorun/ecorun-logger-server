@@ -26,6 +26,7 @@ mod audio;
 mod audio_delivery;
 mod cluster;
 mod config;
+mod discord_voice;
 mod map;
 mod mixer;
 mod podium;
@@ -187,8 +188,15 @@ async fn main() -> anyhow::Result<()> {
         cluster.clone(),
         telemetry_updates.clone(),
         mix.clone(),
+        raw_audio_updates.clone(),
     );
     let podium = Arc::new(PodiumHub::from_env(rooms.clone(), rooms_config.clone()));
+    discord_voice::spawn(
+        rooms_config.clone(),
+        mix.clone(),
+        cluster.clone(),
+        raw_audio_updates.clone(),
+    );
     let (layer, io) = SocketIo::builder()
         .with_state(socket_state.clone())
         .build_layer();
@@ -691,13 +699,6 @@ async fn handle_audio_socket(mut socket: WebSocket, state: AppState, initial_roo
             },
             _ = pace.tick(), if !paced.is_empty() => {
                 if let (Some(room), Some(packet)) = (room_id.as_deref(), paced.pop_front()) {
-                    // Keep Socket.IO participants (including the Discord bridge)
-                    // in the same audio room as raw WebSocket logger clients.
-                    if let Some(namespace) = state.io.of(format!("/{room}")) {
-                        if let Err(error) = namespace.emit("audio.packet", &bytes::Bytes::from(packet.clone())).await {
-                            warn!(%error, room, "failed to forward logger audio to Socket.IO");
-                        }
-                    }
                     state.rooms.broadcast_audio(room, session_id, packet).await;
                 }
             },
