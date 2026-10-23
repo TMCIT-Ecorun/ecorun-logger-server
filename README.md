@@ -401,3 +401,39 @@ ECORUN_SERVERS=[{"id":"main","name":"Primary","url":"https://main.example.org","
 ```
 
 クラスタは Socket.IO の専用 namespace を使い、Redis なしで双方向にテレメトリ・地図・音声を同期します。Podium メタデータ・元のサンプル列・名前付きの計測値を各ノードの SQLite に保存します。接続断から復帰すると未受信テレメトリの履歴同期を試みます。`ECORUN_SERVERS=[]` に設定すると、そのノードはクラスタ同期に参加しません。
+
+## Discord VC bridge (optional)
+
+A companion process running on the Logger host can connect a Discord bot to selected
+room voice channels. Room audio goes both directions: Discord users can speak to
+Logger/Pi and web users, and their audio is played in Discord. Each room is
+**disabled by default**. In `cargo run -- admin`, select a room and press `v`,
+enter its Discord voice channel ID, and press Enter. Clear the field to disable.
+Changes are picked up within roughly five seconds; the Logger process does not
+need a restart. The room's Socket.IO authentication key is read locally from
+SQLite and is never sent to Discord.
+
+Create a bot in the Discord Developer Portal, invite it to the guild with
+**View Channel**, **Connect**, and **Speak** permissions, and enable voice receive.
+Install the companion dependencies and run it on the **same host as the SQLite
+room database** (or share its database read-only):
+
+```sh
+python3 -m venv .venv-discord
+.venv-discord/bin/pip install -r discord_bridge/requirements.txt
+export ECORUN_DISCORD_BOT_TOKEN='YOUR_BOT_TOKEN'
+export ECORUN_DB_PATH='ecorun.sqlite3'
+export ECORUN_DISCORD_SERVER_URL='http://127.0.0.1:3000'
+.venv-discord/bin/python discord_bridge/bridge.py
+```
+
+The Logger server must be running first. For production, run this Python
+process under a supervisor alongside the Rust server. Install libopus and a
+working Discord voice encryption backend on the host. One Discord bot can
+connect to **only one voice channel per Discord guild at a time**; multiple
+Logger rooms on the same guild require separate bot tokens/processes (and thus
+separate selection of rooms). Failed connections are retried on the next poll.
+Discord provides 48 kHz stereo PCM; the bridge converts to and from the
+Logger's 8 kHz mono Opus stream. Audio packets are queued with bounded memory.
+No Discord messages or text permissions are required. Avoid bridging a voice
+channel to itself via another audio client, which can cause feedback.

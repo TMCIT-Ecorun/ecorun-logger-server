@@ -30,3 +30,7 @@ ecorun.sqlite3-shm
 .aws/
 
 .gitdata/
+
+# Python Discord companion
+.venv-discord/
+__pycache__/

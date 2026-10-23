@@ -20,6 +20,7 @@ use crate::config::{validate_room_id, RoomConfig, RoomStore};
 
 enum Mode {
     List,
+    DiscordChannel { room_id: String, value: String },
     Create { field: usize, values: [String; 3] },
     ConfirmDelete,
     ShowKey { title: String, key: String },
@@ -128,6 +129,14 @@ fn run_loop(
                         };
                     }
                 }
+                KeyCode::Char('v') => {
+                    if let Some(room) = rooms.get(selected) {
+                        mode = Mode::DiscordChannel {
+                            room_id: room.id.clone(),
+                            value: room.discord_channel_id.clone().unwrap_or_default(),
+                        };
+                    }
+                }
                 KeyCode::Up => selected = selected.saturating_sub(1),
                 KeyCode::Down => selected = (selected + 1).min(rooms.len().saturating_sub(1)),
                 _ => {}
@@ -151,6 +160,28 @@ fn run_loop(
                     mode = Mode::List;
                 }
             }
+            Mode::DiscordChannel { room_id, value } => match key.code {
+                KeyCode::Esc => mode = Mode::List,
+                KeyCode::Backspace => {
+                    value.pop();
+                }
+                KeyCode::Enter => {
+                    let selected_id = room_id.clone();
+                    let channel = (!value.is_empty()).then_some(value.as_str());
+                    let result = store.set_discord_channel(&selected_id, channel);
+                    message = Some((
+                        match result {
+                            Ok(true) => format!("Discord VC updated for {selected_id}"),
+                            Ok(false) => "Room not found".into(),
+                            Err(error) => error.to_string(),
+                        },
+                        Instant::now() + Duration::from_secs(3),
+                    ));
+                    mode = Mode::List;
+                }
+                KeyCode::Char(ch) if ch.is_ascii_digit() => value.push(ch),
+                _ => {}
+            },
             Mode::Create { field, values } => match key.code {
                 KeyCode::Esc => mode = Mode::List,
                 KeyCode::Tab => *field = (*field + 1) % 3,
@@ -241,6 +272,14 @@ fn draw(
             matches!(mode, Mode::ConfirmDelete),
         ),
         Mode::Create { field, values } => draw_form(frame, body, *field, values),
+        Mode::DiscordChannel { room_id, value } => {
+            let text = format!("Discord voice channel ID for {room_id}\n\n{value}▌\n\nEnter: save | Empty: disable | Esc: cancel");
+            frame.render_widget(
+                Paragraph::new(text)
+                    .block(Block::default().borders(Borders::ALL).title(" Discord VC ")),
+                body,
+            );
+        }
         Mode::ShowKey { title, key } => draw_key(frame, body, title, key),
     }
     draw_footer(frame, footer, mode, message);
@@ -265,7 +304,7 @@ fn draw_list(
     selected: usize,
     confirming: bool,
 ) {
-    let header = Row::new(["", "ID", "NAME", "SOCKET KEY", "PODIUM"])
+    let header = Row::new(["", "ID", "NAME", "SOCKET KEY", "PODIUM", "DISCORD VC"])
         .style(Style::default().add_modifier(Modifier::BOLD));
     let rows = rooms.iter().enumerate().map(|(index, room)| {
         let marker = if index == selected { "›" } else { " " };
@@ -280,6 +319,9 @@ fn draw_list(
             room.name.clone(),
             mask(&room.socket_key),
             podium.into(),
+            room.discord_channel_id
+                .clone()
+                .unwrap_or_else(|| "off".into()),
         ])
     });
     let table = Table::new(
@@ -290,6 +332,7 @@ fn draw_list(
             Constraint::Min(20),
             Constraint::Length(18),
             Constraint::Length(14),
+            Constraint::Length(21),
         ],
     )
     .header(header)
@@ -385,7 +428,8 @@ fn draw_key(frame: &mut ratatui::Frame<'_>, area: Rect, title: &str, key: &str) 
 
 fn draw_footer(frame: &mut ratatui::Frame<'_>, area: Rect, mode: &Mode, message: Option<&str>) {
     let help = match mode {
-        Mode::List => "↑/↓ select  ·  n create  ·  k key  ·  r regenerate  ·  p podium  ·  d delete  ·  q quit",
+        Mode::List => "↑/↓ select · n create · k key · r regenerate · p podium · v Discord VC · d delete · q quit",
+        Mode::DiscordChannel { .. } => "Digits: channel ID · Enter save · Empty: disable · Esc cancel",
         Mode::ConfirmDelete => "y / Enter delete  ·  any other key cancel",
         Mode::Create { .. } => "Tab next field  ·  Enter save  ·  Esc cancel",
         Mode::ShowKey { .. } => "Enter / Esc return",
