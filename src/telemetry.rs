@@ -54,7 +54,11 @@ mod tests {
 
     #[test]
     fn names_follow_meta_order() {
-        let meta = vec![json!({"nm":"Utc"}), json!({"ut":"m"}), json!({"nm":"Latitude"})];
+        let meta = vec![
+            json!({"nm":"Utc"}),
+            json!({"ut":"m"}),
+            json!({"nm":"Latitude"}),
+        ];
         assert_eq!(channel_names(&meta), names(&["Utc", "ch1", "Latitude"]));
     }
 
@@ -62,7 +66,12 @@ mod tests {
     fn labels_only_present_channels() {
         let names = names(&["Utc", "Speed", "Latitude", "Longitude"]);
         // Speed missing: mask 0b1101.
-        let row = vec![json!(1_760_000_000_000_u64), json!(35.5), json!(139.7), json!(13)];
+        let row = vec![
+            json!(1_760_000_000_000_u64),
+            json!(35.5),
+            json!(139.7),
+            json!(13),
+        ];
         let named = named_row(&names, &row).unwrap();
         assert_eq!(named.len(), 3);
         assert_eq!(named["Latitude"], json!(35.5));

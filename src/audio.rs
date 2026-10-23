@@ -1,4 +1,4 @@
-use opus::{Application, Bitrate, Channels, Decoder, Encoder, Error as OpusError};
+use opus::{Application, Bitrate, Channels, Decoder, Encoder, Error as OpusError, Repacketizer};
 use std::fmt;
 
 pub const SAMPLE_RATE: u32 = 8_000;
@@ -18,7 +18,11 @@ impl fmt::Display for AudioError {
         match self {
             Self::Codec(error) => write!(f, "Opus error: {error}"),
             Self::InvalidFrameSize(size) => {
-                write!(f, "frame has {size} samples, expected {FRAME_SAMPLES}")
+                write!(
+                    f,
+                    "frame has {size} samples, expected {FRAME_SAMPLES} or {}",
+                    FRAME_SAMPLES * 2
+                )
             }
             Self::PacketTooLarge(size) => {
                 write!(f, "packet is {size} bytes, maximum is {MAX_PACKET_SIZE}")
@@ -72,12 +76,47 @@ impl AudioCodec for OpusCodec {
         Ok(pcm)
     }
     fn encode(&mut self, pcm: &[i16]) -> Result<Vec<u8>, AudioError> {
-        if pcm.len() != FRAME_SAMPLES {
+        if pcm.len() != FRAME_SAMPLES && pcm.len() != FRAME_SAMPLES * 2 {
             return Err(AudioError::InvalidFrameSize(pcm.len()));
         }
+        if pcm.len() == FRAME_SAMPLES {
+            let mut packet = vec![0_u8; MAX_PACKET_SIZE];
+            let size = self.encoder.encode(pcm, &mut packet)?;
+            packet.truncate(size);
+            return Ok(packet);
+        }
+
+        // libopus encodes at most 60 ms in one call. A 120 ms wire packet
+        // contains two consecutive 60 ms frames in a single Opus packet.
+        let mut first = vec![0_u8; MAX_PACKET_SIZE];
+        let mut second = vec![0_u8; MAX_PACKET_SIZE];
+        let first_size = self.encoder.encode(&pcm[..FRAME_SAMPLES], &mut first)?;
+        let second_size = self.encoder.encode(&pcm[FRAME_SAMPLES..], &mut second)?;
         let mut packet = vec![0_u8; MAX_PACKET_SIZE];
-        let size = self.encoder.encode(pcm, &mut packet)?;
+        let size = Repacketizer::new()?
+            .combine(&[&first[..first_size], &second[..second_size]], &mut packet)?;
         packet.truncate(size);
         Ok(packet)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encodes_and_decodes_two_60ms_frames_as_one_120ms_packet() {
+        let mut encoder = OpusCodec::new().unwrap();
+        encoder.set_bitrate(6_000).unwrap();
+        let pcm: Vec<i16> = (0..960)
+            .map(|index| {
+                ((index as f64 / 8_000.0 * 440.0 * std::f64::consts::TAU).sin() * 8_000.0) as i16
+            })
+            .collect();
+        let packet = encoder.encode(&pcm).unwrap();
+        assert!(packet.len() <= MAX_PACKET_SIZE);
+        let mut decoder = Decoder::new(8_000, Channels::Mono).unwrap();
+        let mut decoded = [0_i16; 960];
+        assert_eq!(decoder.decode(&packet, &mut decoded, false).unwrap(), 960);
     }
 }

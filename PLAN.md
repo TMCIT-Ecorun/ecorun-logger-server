@@ -117,19 +117,21 @@
 
 ### Phase 4.1: Socket.IO化と単一サーバ構成
 
-Phase 4で実装したブラウザ向けの独自WebSocket制御プロトコルを Socket.IO に置き換え、Rust側は `socketioxide`、ブラウザ側は公式 `socket.io-client` を使用する。単一のサーバプロセスをprimaryとして、同じroomの参加者状態・制御イベント・音声をプロセス内で共有する。Redis adapterは使用しない。
+Phase 4で実装したブラウザ向けの独自WebSocket制御プロトコルを Socket.IO に置き換え、Rust側は `socketioxide`、ブラウザ側は公式 `socket.io-client` を使用する。複数のLoggerプロセスに接続が分散しても、同じroomの参加者状態・制御イベント・音声が共有される構成を目標とする。外部Redisなどの共有サービスは必須にせず、Webクライアントが設定済みの全LoggerノードへSocket.IO接続を張る方式を採用する。
 
 - ブラウザは Socket.IO のイベント通信を使い、音声packetはイベントpayloadのbinaryデータとして送受信する。
 - ブラウザの接続先は `io(origin + "/" + encodeURIComponent(roomId), { path: "/socket.io/" })` 相当とし、Socket.IO namespaceのパス部分をroom IDとして扱う。`/socket.io/` はSocket.IO transport endpointとして固定する。
 - Loggerは接続namespaceからroom IDを決定し、接続時に対応する内部roomへ自動参加させる。クライアントから `room.join` を送ってroomを選択・変更する仕組みは廃止する。room切替は接続先namespace URLを変更して再接続する。
 - `room.state`、参加者のmute/PTT状態、切断時の退出処理は、Socket.IO接続ライフサイクルとroomイベントに合わせて再定義する。
 - roomの存在確認とSocket.IO認証はサーバ側SQLiteで行う。認証keyはroom単位でDBへ保存し、`GET /api/rooms` には秘密情報を含めない。
+- 分散ノード間のroom参加者・制御イベント・音声配信は、各Webクライアントが全Loggerノードへ接続することで同期する。各ノードの状態はローカルに保持し、ブラウザ側で `client_id` と音声packet sequenceを使って重複排除する。
+- Logger telemetryも設定済みの各Loggerノードへ送信し、各ノードがローカルNDJSONへ記録する。これによりRedis等の共有状態ストアなしで各ノードに同じ測定値を記録できる。
 - クライアントが接続先Loggerサーバを選択できるようにする。サーバ一覧はHTTP APIまたはSocket.IOイベントで取得可能にし、少なくとも識別子、接続URL、表示名、利用可否/状態を定義する。API/eventの方式、一覧の供給元（設定値または管理データ）、公開範囲と認証を実装前に確定する。秘密情報を一覧レスポンスへ含めない。
-- 接続断時は `socket.io-client` の再接続機能を有効化し、指数バックオフ等の再試行間隔、最大待機時間、接続中/再接続中/失敗状態をUIに定義する。選択したサーバが復旧しない場合の別サーバへのフェイルオーバーは、同一Redis共有状態を前提に候補リストから順次試行するか、ユーザー選択を維持するかを決める。再接続後は認証・namespace/room参加・`room.state` とparticipant状態を再同期し、重複参加者や古い状態を残さない。
+- 接続断時は `socket.io-client` の再接続機能を有効化し、指数バックオフ等の再試行間隔、最大待機時間、接続中/再接続中/失敗状態をUIに定義する。設定済みノードの一部が復旧しない場合も、残った接続で通話を継続する。再接続後はnamespace/room参加、`room.state`、participant状態を再同期し、`client_id` で重複参加者をまとめる。
 - Pi向け `/ws/audio/{room_id}` の既存WebSocketプロトコルは互換性境界として維持し、Socket.IO化の対象はブラウザ/PWA経路とする。
 - Socket.IO接続パス、room URLの形式、イベント名とpayload、binary音声形式、エラー、再接続時の状態同期を仕様として固定する。
 
-**完了条件:** ブラウザでサーバ一覧を取得・選択してURLでroomに参加でき、`room.join` を使わずに音声・参加者状態を送受信できる。存在しないroomは接続時に拒否され、認証keyはDB保存される。切断後の自動再接続と状態再同期が確認でき、1接続の切断がroom全体を巻き込まない。
+**完了条件:** ブラウザでサーバ一覧を取得して設定済みLoggerノードへ同時接続し、`room.join` を使わずに音声・参加者状態を送受信できる。複数Loggerノードに接続したクライアント同士でも同一room内で音声と状態が同期する。存在しないroomの拒否とDBに保存した認証keyの検証を維持する。切断後の自動再接続と状態再同期が確認でき、1ノードの切断がroom全体を巻き込まない。
 
 ### Phase 5: メトリクス / Podium
 

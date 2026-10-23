@@ -4,7 +4,7 @@ use anyhow::Context;
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        Path, State,
+        Path, Query, State,
     },
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
@@ -16,21 +16,24 @@ use socketioxide::{adapter::Adapter, layer::SocketIoLayer, SocketIo};
 use socketioxide_core::adapter::DefinedAdapter;
 use tokio::{
     net::TcpListener,
-    sync::mpsc,
+    sync::{broadcast, mpsc},
     time::{interval, timeout, MissedTickBehavior},
 };
 use tracing::{info, warn};
 
 mod admin;
 mod audio;
+mod audio_delivery;
+mod cluster;
 mod config;
 mod map;
 mod mixer;
 mod podium;
-mod replication;
 mod room;
 mod socketio_api;
+#[cfg(test)]
 mod telemetry;
+mod telemetry_bridge;
 
 use audio::{AudioCodec, OpusCodec};
 use config::RoomStore;
@@ -39,7 +42,7 @@ use podium::PodiumHub;
 use room::{RoomManager, SessionId};
 
 const DEFAULT_BIND: &str = "0.0.0.0:3000";
-// At 60 ms per packet this bounds queued audio to 180 ms per receiver.
+// At 120 ms per mixed packet this bounds queued audio to 360 ms per receiver.
 const AUDIO_QUEUE_CAPACITY: usize = 3;
 // A logger on LTE sends half a second of voice in one burst (one modem send).
 // Its frames are passed on one per 60 ms instead, so the 3-packet receiver
@@ -54,8 +57,10 @@ struct AppState {
     mix: Arc<MixHub>,
     podium: Arc<PodiumHub>,
     map: Arc<map::MapStore>,
-    io: SocketIo,
-    replication: replication::Replicator,
+    telemetry: Arc<socketio_api::TelemetryStore>,
+    telemetry_updates: broadcast::Sender<socketio_api::TelemetryEvent>,
+    raw_audio_updates: broadcast::Sender<(String, String, u64, Vec<u8>)>,
+    cluster: cluster::Cluster,
 }
 
 #[derive(Debug, Deserialize)]
@@ -81,7 +86,7 @@ enum ControlEvent {
         #[serde(default)]
         bitrate: Option<u32>,
         #[serde(default)]
-        mixer: Option<bool>,
+        mixer: Option<serde_json::Value>,
         #[serde(default)]
         forward_to_logger: Option<bool>,
     },
@@ -117,12 +122,9 @@ struct AudioFormat {
 
 impl AudioFormat {
     fn is_server_format(&self) -> bool {
-        *self
-            == AudioFormat {
-                sample_rate: audio::SAMPLE_RATE,
-                channels: 1,
-                frame_ms: audio::FRAME_MS,
-            }
+        self.sample_rate == audio::SAMPLE_RATE
+            && self.channels == 1
+            && (self.frame_ms == audio::FRAME_MS || self.frame_ms == 120)
     }
     fn is_logger_mix_format(&self) -> bool {
         *self
@@ -172,23 +174,34 @@ async fn main() -> anyhow::Result<()> {
     let map = Arc::new(map::MapStore::open(&db_path).context("failed to open SQLite database")?);
     let mix = Arc::new(MixHub::from_env());
     mix.clone().spawn();
-    let replication = replication::Replicator::start(&rooms_config);
+    let telemetry = Arc::new(socketio_api::TelemetryStore::new());
+    let (telemetry_updates, _) = broadcast::channel(512);
+    let (raw_audio_updates, _) = broadcast::channel(128);
+    let cluster = cluster::Cluster::from_env()?;
+    let delivery = Arc::new(audio_delivery::AudioDelivery::new());
     let socket_state = socketio_api::SocketState::new(
         map.clone(),
         rooms_config.clone(),
+        telemetry.clone(),
+        delivery.clone(),
+        cluster.clone(),
+        telemetry_updates.clone(),
         mix.clone(),
-        replication.clone(),
     );
     let podium = Arc::new(PodiumHub::from_env(rooms.clone(), rooms_config.clone()));
-    let (layer, io) = SocketIo::builder().with_state(socket_state).build_layer();
+    let (layer, io) = SocketIo::builder()
+        .with_state(socket_state.clone())
+        .build_layer();
     let state = AppState {
         rooms_config,
         mix,
         podium,
         map: map.clone(),
+        telemetry,
+        telemetry_updates,
+        raw_audio_updates,
         rooms,
-        io: io.clone(),
-        replication: replication.clone(),
+        cluster,
     };
     let routes = Router::new()
         .route("/healthz", get(healthz))
@@ -205,7 +218,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/service-worker.js", get(web_service_worker))
         .route("/_app/{*path}", get(web_asset));
 
-    serve_app(routes, state, layer, io, bind).await?;
+    serve_app(routes, state, layer, io, bind, socket_state).await?;
+
     Ok(())
 }
 
@@ -215,10 +229,110 @@ async fn serve_app<A: Adapter + DefinedAdapter>(
     layer: SocketIoLayer<A>,
     io: SocketIo<A>,
     bind: String,
+    socket_state: socketio_api::SocketState,
 ) -> anyhow::Result<()> {
     socketio_api::register(&io)
         .await
         .context("failed to register Socket.IO namespaces")?;
+    let configured_rooms = state
+        .rooms_config
+        .list()?
+        .into_iter()
+        .map(|room| room.id)
+        .collect();
+    state.cluster.run(configured_rooms, state.map.clone());
+    let mut cluster_rx = state.cluster.subscribe_inbound();
+    let cluster_io = io.clone();
+    let cluster_state = socket_state.clone();
+    tokio::spawn(async move {
+        loop {
+            match cluster_rx.recv().await {
+                Ok(event) => {
+                    socketio_api::handle_cluster_event(&cluster_io, &cluster_state, event).await
+                }
+                Err(broadcast::error::RecvError::Lagged(count)) => {
+                    warn!(count, "cluster messages dropped")
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
+    // Dynamic room namespaces are created when a browser connects. Publish
+    // Raw WebSocket telemetry to their authenticated Socket.IO room members.
+    let mut telemetry_rx = state.telemetry_updates.subscribe();
+    let telemetry_io = io.clone();
+    tokio::spawn(async move {
+        loop {
+            let event = match telemetry_rx.recv().await {
+                Ok(event) => event,
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    warn!(skipped, "Socket.IO telemetry broadcast fell behind");
+                    continue;
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+            };
+            // SocketIo::of() cannot select a dynamic /{room_id} namespace.
+            let path = format!("/{}", event.room_id);
+            if let Some(namespace) = telemetry_io
+                .nsps()
+                .into_iter()
+                .find(|ns| ns.ns_path() == path.as_str())
+            {
+                if let Err(error) = namespace
+                    .to(event.room_id.clone())
+                    .emit("telemetry", &event)
+                    .await
+                {
+                    warn!(%error, room = %event.room_id, "failed to broadcast telemetry to Socket.IO");
+                }
+            }
+        }
+    });
+    // Bridge logger microphone audio to authenticated browsers in this room.
+    let mut raw_audio_rx = state.raw_audio_updates.subscribe();
+    let audio_io = io.clone();
+    let audio_state = socket_state.clone();
+    tokio::spawn(async move {
+        loop {
+            let (room, source, sequence, packet) = match raw_audio_rx.recv().await {
+                Ok(event) => event,
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => break,
+            };
+            if let Some(namespace) = audio_io.of(format!("/{room}")) {
+                socketio_api::deliver_audio_to_recipients(
+                    namespace.to(room.clone()).sockets(),
+                    &audio_state,
+                    &room,
+                    &source,
+                    sequence,
+                    &packet,
+                )
+                .await;
+            }
+        }
+    });
+    // Authenticated Socket.IO presence is a per-node signal. A connected
+    // browser can select the node that actually holds the logger session.
+    let status_io = io.clone();
+    let status_rooms = state.rooms.clone();
+    let status_config = state.rooms_config.clone();
+    tokio::spawn(async move {
+        let mut timer = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            timer.tick().await;
+            let Ok(configured) = status_config.list() else {
+                continue;
+            };
+            for entry in configured {
+                let room = entry.id;
+                let count = status_rooms.logger_count(&room).await;
+                if let Some(namespace) = status_io.of(format!("/{room}")) {
+                    let _ = namespace.to(room.clone()).emit("logger.status", &serde_json::json!({"room_id":room,"connected": count > 0,"count": count})).await;
+                }
+            }
+        }
+    });
     let app = routes.layer(layer).with_state(state);
     let listener = TcpListener::bind(&bind)
         .await
@@ -354,7 +468,15 @@ async fn map_put(
             .into_response();
     }
     match state.map.save_map(&room_id, &map) {
-        Ok(()) => axum::Json(map).into_response(),
+        Ok(()) => {
+            state
+                .cluster
+                .publish(state.cluster.event(cluster::ClusterKind::Map {
+                    room: room_id,
+                    map: map.clone(),
+                }));
+            axum::Json(map).into_response()
+        }
         Err(error) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             axum::Json(serde_json::json!({"error":error.to_string()})),
@@ -367,6 +489,7 @@ async fn telemetry_get(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(room_id): Path<String>,
+    Query(query): Query<TelemetryQuery>,
 ) -> impl IntoResponse {
     if !request_authorized(&headers, &state.rooms_config, &room_id) {
         return StatusCode::UNAUTHORIZED.into_response();
@@ -378,7 +501,12 @@ async fn telemetry_get(
         )
             .into_response();
     }
-    match state.map.recent_telemetry(&room_id, 100) {
+    match state.map.telemetry_history(
+        &room_id,
+        query.since.as_deref(),
+        query.until.as_deref(),
+        5000,
+    ) {
         Ok(events) => ([(header::CACHE_CONTROL, "no-store")], axum::Json(events)).into_response(),
         Err(error) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -386,6 +514,12 @@ async fn telemetry_get(
         )
             .into_response(),
     }
+}
+
+#[derive(Default, Deserialize)]
+struct TelemetryQuery {
+    since: Option<String>,
+    until: Option<String>,
 }
 
 async fn web_index() -> Response {
@@ -456,21 +590,6 @@ async fn audio_ws(
         .into_response()
 }
 
-/// Send a telemetry event to the room's web clients (Socket.IO) and to its
-/// non-logger `/ws/audio` clients. Loggers never get it back: on LTE every
-/// downlink byte competes with their own telemetry.
-async fn publish_telemetry(state: &AppState, room: &str, event: serde_json::Value) {
-    if let Some(namespace) = state.io.of(format!("/{room}")) {
-        if let Err(error) = namespace.emit("telemetry", &event).await {
-            warn!(%error, %room, "failed to send telemetry to web clients");
-        }
-    }
-    state
-        .rooms
-        .broadcast_control_to_non_loggers(room, event.to_string())
-        .await;
-}
-
 /// Anything sending Podium data is a logger, even when its hello carried no
 /// `role` (EcoLogger V2 up to 2026-10 does not send one).
 async fn mark_logger(state: &AppState, room: &str, session_id: SessionId, is_logger: &mut bool) {
@@ -482,12 +601,15 @@ async fn mark_logger(state: &AppState, room: &str, session_id: SessionId, is_log
 
 async fn handle_audio_socket(mut socket: WebSocket, state: AppState, initial_room_id: String) {
     let session_id = state.rooms.new_session_id();
+    let mut podium_channels = telemetry_bridge::PodiumChannels::default();
     let (audio_tx, mut audio_rx) = mpsc::channel::<Vec<u8>>(AUDIO_QUEUE_CAPACITY);
     let (control_tx, mut control_rx) = mpsc::channel::<String>(CONTROL_QUEUE_CAPACITY);
     let room_id: Option<String> = Some(initial_room_id.clone());
     let mut receive_audio = true;
+    let mut raw_audio_sequence = 0_u64;
     // Used once the client's hello asks for the logger mix; it then gets only mix_rx.
     let (mix_tx, mut mix_rx) = mpsc::channel::<Vec<u8>>(AUDIO_QUEUE_CAPACITY);
+
     let mut codec = match OpusCodec::new() {
         Ok(codec) => codec,
         Err(error) => {
@@ -508,7 +630,6 @@ async fn handle_audio_socket(mut socket: WebSocket, state: AppState, initial_roo
     let mut pending_pcm: Vec<i16> = Vec::with_capacity(audio::FRAME_SAMPLES * 2);
     // Channel names from this logger's latest `podium.meta`, used to label
     // its sample rows for the web map.
-    let mut podium_names: Vec<String> = Vec::new();
     let mut is_logger = false;
     let mut paced: VecDeque<Vec<u8>> = VecDeque::new();
     let mut pace = interval(Duration::from_millis(u64::from(audio::FRAME_MS)));
@@ -555,7 +676,14 @@ async fn handle_audio_socket(mut socket: WebSocket, state: AppState, initial_roo
     loop {
         tokio::select! {
             outbound = audio_rx.recv() => match outbound {
-                Some(packet) => if receive_audio && socket.send(Message::Binary(packet.into())).await.is_err() { break },
+                Some(packet) => if receive_audio {
+                    // Slow LTE audio writes are expendable: never let one stall
+                    // the logger's telemetry/control receive loop indefinitely.
+                    match timeout(Duration::from_millis(50), socket.send(Message::Binary(packet.into()))).await {
+                        Ok(Ok(())) | Err(_) => {},
+                        Ok(Err(_)) => break,
+                    }
+                },
                 None => break,
             },
             Some(packet) = mix_rx.recv() => {
@@ -591,10 +719,15 @@ async fn handle_audio_socket(mut socket: WebSocket, state: AppState, initial_roo
                                         }
                                         match codec.encode(&frame) {
                                             Ok(encoded) => {
-                                                paced.push_back(encoded);
-                                                if paced.len() > PACED_AUDIO_MAX {
-                                                    paced.pop_front();
+                                                if state.rooms.source_can_speak(room, session_id).await {
+                                                    let source = format!("raw:{}:{session_id}", state.cluster.node_id());
+                                                    let _ = state.raw_audio_updates.send((room.to_owned(), source.clone(), raw_audio_sequence, encoded.clone()));
+                                                    state.cluster.publish(state.cluster.event(cluster::ClusterKind::Audio { room: room.to_owned(), source, sequence: raw_audio_sequence, packet: encoded.clone(), forward_to_logger: false }));
+                                                    raw_audio_sequence = raw_audio_sequence.wrapping_add(1);
                                                 }
+                                                paced.push_back(encoded);
+                                                if paced.len() > PACED_AUDIO_MAX { paced.pop_front(); }
+
                                             }
                                             Err(error) => warn!(%session_id, %error, "audio encode failed"),
                                         }
@@ -617,9 +750,10 @@ async fn handle_audio_socket(mut socket: WebSocket, state: AppState, initial_roo
                             }
                             if let Some(room) = room_id.as_deref() {
                                 is_logger = role.as_deref() == Some("logger");
+
                                 if let Some(config) = audio_config.as_ref() {
                                     if !config.is_server_format() {
-                                        let _ = control_tx.try_send(serde_json::to_string(&ServerEvent::Error { code: "unsupported_audio_config", message: "server audio format is 8 kHz mono 60 ms" }).unwrap());
+                                        let _ = control_tx.try_send(serde_json::to_string(&ServerEvent::Error { code: "unsupported_audio_config", message: "server audio format is 8 kHz mono 60 or 120 ms" }).unwrap());
                                     }
                                 }
                                 if let Some(bitrate) = bitrate {
@@ -633,6 +767,10 @@ async fn handle_audio_socket(mut socket: WebSocket, state: AppState, initial_roo
                                 // A mix listener gets its audio from the mixer only.
                                 let per_talker = !mix_listener && forward_to_logger.unwrap_or(receive_audio);
                                 state.rooms.set_receive_audio(room, session_id, per_talker).await;
+                                if mix_listener {
+                                    let _ = control_tx.try_send(serde_json::to_string(&ServerEvent::AudioConfig { sample_rate: audio::SAMPLE_RATE, channels: 1, frame_ms: 120 }).unwrap());
+                                }
+
                             }
                             info!(%session_id, ?client_id, ?protocol, ?role, ?mixer, ?bitrate, receive_audio, mix_listener, ?forward_to_logger, "client hello");
                         }
@@ -661,13 +799,10 @@ async fn handle_audio_socket(mut socket: WebSocket, state: AppState, initial_roo
                         Ok(ControlEvent::PodiumMeta { meta }) => {
                             if let Some(room) = room_id.as_deref() {
                                 mark_logger(&state, room, session_id, &mut is_logger).await;
-                                podium_names = telemetry::channel_names(&meta);
-                                let persisted = serde_json::json!({"meta": meta});
-                                if let Err(error) = state.map.append_telemetry(room, "podium.meta", None, &persisted) {
-                                    warn!(%error, "failed to persist Podium metadata");
-                                }
-                                state.replication.forward(room, "podium.meta", None, &persisted);
-                                let meta = persisted.get("meta").and_then(|value| value.as_array()).cloned().unwrap_or_default();
+                                podium_channels.update(&meta);
+                                let persisted = serde_json::json!({"meta": &meta});
+                                telemetry_bridge::publish(&state, room, "podium.meta".into(), None, persisted).await;
+
                                 if let Err(error) = state.podium.meta(room, meta).await {
                                     let _ = control_tx.try_send(serde_json::to_string(&ServerEvent::Error {
                                         code: error.code(), message: error.message(),
@@ -678,24 +813,21 @@ async fn handle_audio_socket(mut socket: WebSocket, state: AppState, initial_roo
                         Ok(ControlEvent::PodiumSamples { samples }) => {
                             if let Some(room) = room_id.as_deref() {
                                 mark_logger(&state, room, session_id, &mut is_logger).await;
-                                // Only the newest row: the map needs the position, not every 100 ms sample.
-                                let latest = samples.last().and_then(|row| telemetry::named_row(&podium_names, row));
-                                let persisted = serde_json::json!({"samples": samples});
-                                match state.map.append_telemetry(room, "podium", None, &persisted) {
-                                    Err(error) => warn!(%error, "failed to persist Podium telemetry"),
-                                    Ok(id) => {
-                                        state.replication.forward(room, "podium", None, &persisted);
-                                        if let Some(data) = latest {
-                                            let event = serde_json::json!({"type":"telemetry","id":id,"source":"logger","session_id":session_id,"data":data});
-                                            publish_telemetry(&state, room, event).await;
-                                        }
-                                    }
-                                }
-                                let samples = persisted.get("samples").and_then(|value| value.as_array()).cloned().unwrap_or_default().into_iter().map(|value| value.as_array().cloned().unwrap_or_default()).collect();
-                                if let Err(error) = state.podium.samples(room, samples).await {
+                                // Keep an original copy in SQLite for diagnostics.
+                                let persisted = serde_json::json!({"samples": &samples});
+                                telemetry_bridge::publish(&state, room, "podium.raw".into(), None, persisted).await;
+                                // The Podium relay must receive the logger's exact rows.
+                                if let Err(error) = state.podium.samples(room, samples.clone()).await {
                                     let _ = control_tx.try_send(serde_json::to_string(&ServerEvent::Error {
                                         code: error.code(), message: error.message(),
                                     }).unwrap());
+                                }
+                                for row in &samples {
+                                    if let Some(data) = podium_channels.decode(row) {
+                                        telemetry_bridge::publish(&state, room, "podium".into(), None, data).await;
+                                    } else {
+                                        warn!(%session_id, room, "skipping Podium sample without usable metadata, numeric values or validity mask");
+                                    }
                                 }
                             }
                         }
@@ -703,14 +835,8 @@ async fn handle_audio_socket(mut socket: WebSocket, state: AppState, initial_roo
                             if let Some(room) = room_id.as_deref() {
                                 let payload = data.unwrap_or_else(|| serde_json::json!({}));
                                 let source = source.unwrap_or_else(|| "logger".into());
-                                match state.map.append_telemetry(room, &source, timestamp.as_deref(), &payload) {
-                                    Ok(id) => {
-                                        let event = serde_json::json!({"type":"telemetry","id":id,"source":source,"session_id":session_id,"timestamp":timestamp,"data":payload});
-                                        state.replication.forward(room, &source, timestamp.as_deref(), &payload);
-                                        publish_telemetry(&state, room, event).await;
-                                    }
-                                    Err(error) => warn!(%error, "failed to persist telemetry"),
-                                }
+                                telemetry_bridge::publish(&state, room, source, timestamp, payload).await;
+
                             }
                         }
                         Err(error) => {

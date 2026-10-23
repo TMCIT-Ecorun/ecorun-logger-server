@@ -3,7 +3,7 @@
   import { io, type Socket } from 'socket.io-client';
   import { L, loadLeaflet } from '$lib/local-map';
 
-  type Telemetry = { source: string; timestamp?: string; data: Record<string, unknown> };
+  type Telemetry = { event_id?: string | null; source: string; timestamp?: string | null; received_at?: string | number; data: Record<string, unknown> };
   const SERVER_SAMPLE_RATE = 8000;
   const SERVER_FRAME_MS = 60;
   const OPUS_SAMPLE_RATES = [8000, 12000, 16000, 24000, 48000];
@@ -11,14 +11,20 @@
   let opusSampleRate = 48000;
   let opusFrameMs = 20;
   let opusBitrate = 8000;
+  const RECEIVE_BITRATES = [4000, 6000, 8000, 12000, 16000, 24000, 32000];
+  const RECEIVE_FRAME_MS = [20, 40, 60, 120];
+  let forwardToLogger = true;
+  let receiveBitrate = 8000;
+  let receiveFrameMs = 60;
   let roomId = 'main';
   let endpoint = '';
   type LoggerServer = { id: string; name: string; url: string; available: boolean };
   let servers: LoggerServer[] = [];
   let selectedServer = 'local';
   let status = 'disconnected';
-  let sessionId: number | null = null;
-  type Participant = { session_id: number | string; muted: boolean; ptt: boolean };
+  const clientId = crypto.randomUUID();
+  let sequence = 0;
+  type Participant = { session_id: number | string; client_id?: string | null; muted: boolean; ptt: boolean };
   let participants: Participant[] = [];
   let telemetry: Telemetry[] = [];
   let telemetryVisible = false;
@@ -26,11 +32,20 @@
   let ptt = false;
   let keyboardPttHeld = false;
   let muted = false;
-  let ws: Socket | null = null;
-  let failoverSockets: Socket[] = [];
-  let failoverTimer: ReturnType<typeof setTimeout> | null = null;
-  let connectionGeneration = 0;
-  let activeEndpoint = '';
+  let sockets: Socket[] = [];
+  let activeSocket: Socket | null = null;
+  let activeServerName = '';
+  let activeLoggerConnected = false;
+  const socketTargets = new Map<Socket, string>();
+  const loggerPresence = new Map<Socket, boolean>();
+  const loggerPresenceSince = new Map<Socket, number>();
+  const LOGGER_SWITCH_STABLE_MS = 3000;
+  let mapStateReceived = false;
+  let connectedSocketCount = 0;
+  const nodeParticipants = new Map<Socket, Map<string, Participant>>();
+  const telemetryKeys = new Set<string>();
+  const receivedAudioKeys = new Set<string>();
+
   let audioContext: AudioContext | null = null;
   let mediaStream: MediaStream | null = null;
   let sourceNode: MediaStreamAudioSourceNode | null = null;
@@ -56,6 +71,92 @@
   let decodedFrameCount = 0;
   let decodeTimestamp = 0;
   let wakeLock: WakeLockSentinel | null = null;
+  let chosenMetrics: string[] = [];
+  let metricSelectionInitialized = false;
+  let chartTimeRange = '30';
+  let customRangeStart = '';
+  let customRangeEnd = '';
+  let metricSearch = '';
+  let historyStatus = '';
+  let historyLoading = false;
+  $: availableMetrics = Array.from(new Set(telemetry.flatMap((event) => Object.entries(event.data)
+    .filter(([, value]) => typeof value === 'number' && Number.isFinite(value))
+    .map(([key]) => `${event.source}:${key}`)))).sort();
+  $: if (!metricSelectionInitialized && availableMetrics.length) {
+    chosenMetrics = availableMetrics.slice(0, 4);
+    metricSelectionInitialized = true;
+  }
+  $: filteredMetricOptions = availableMetrics.filter((name) => name.toLowerCase().includes(metricSearch.toLowerCase()));
+  $: chartBounds = timeBounds(telemetry, chartTimeRange, customRangeStart, customRangeEnd);
+  $: charts = chosenMetrics.map((metric) => chartData(metric, telemetry, chartBounds));
+
+  function telemetryTime(event: Telemetry): number {
+    for (const value of [event.timestamp, event.received_at]) {
+      if (value == null) continue;
+      const numeric = Number(value);
+      const ms = typeof value === 'number' || (/^\d+$/.test(String(value)) && numeric > 1_000_000_000)
+        ? (numeric < 1e11 ? numeric * 1000 : numeric) : Date.parse(String(value));
+      if (Number.isFinite(ms)) return ms;
+    }
+    return NaN;
+  }
+
+  function timeBounds(events: Telemetry[], range: string, startText: string, endText: string) {
+    const times = events.map(telemetryTime).filter(Number.isFinite);
+    const latest = Math.max(Date.now(), ...times);
+    const earliest = times.length ? Math.min(...times) : latest - 30 * 60_000;
+    if (range === 'custom') {
+      const start = startText ? Date.parse(startText) : earliest;
+      const end = endText ? Date.parse(endText) : latest;
+      return { start: Number.isFinite(start) ? start : earliest, end: Math.max(Number.isFinite(end) ? end : latest, (Number.isFinite(start) ? start : earliest) + 1000) };
+    }
+    if (range === 'all') return { start: earliest, end: Math.max(latest, earliest + 1000) };
+    const minutes = Number(range) || 30;
+    return { start: latest - minutes * 60_000, end: latest };
+  }
+
+  function chartData(metric: string, events: Telemetry[], bounds: { start: number; end: number }) {
+    const colon = metric.indexOf(':');
+    const source = metric.slice(0, colon);
+    const key = metric.slice(colon + 1);
+    const entries = events.filter((event) => event.source === source && typeof event.data[key] === 'number')
+      .map((event) => ({ time: telemetryTime(event), value: Number(event.data[key]) }))
+      .filter((row) => Number.isFinite(row.time) && Number.isFinite(row.value) && row.time >= bounds.start && row.time <= bounds.end)
+      .sort((a, b) => a.time - b.time);
+    const min = entries.length ? Math.min(...entries.map((row) => row.value)) : 0;
+    const max = entries.length ? Math.max(...entries.map((row) => row.value)) : 0;
+    const span = max - min || 1;
+    const interval = Math.max(1, bounds.end - bounds.start);
+    const points = entries.map((row) => `${24 + (row.time - bounds.start) / interval * 452},${136 - (row.value - min) / span * 116}`).join(' ');
+    return { metric, points, count: entries.length, latest: entries.length ? entries[entries.length - 1].value : null, min, max };
+  }
+
+  function setMetricVisible(metric: string, selected: boolean) {
+    chosenMetrics = selected ? [...new Set([...chosenMetrics, metric])] : chosenMetrics.filter((item) => item !== metric);
+    metricSelectionInitialized = true;
+  }
+
+  function zoomChart(inward: boolean) {
+    if (chartTimeRange === 'custom') {
+      const bounds = timeBounds(telemetry, chartTimeRange, customRangeStart, customRangeEnd);
+      const middle = (bounds.start + bounds.end) / 2;
+      const radius = (bounds.end - bounds.start) * (inward ? 0.25 : 1);
+      customRangeStart = formatLocalDateTime(middle - radius);
+      customRangeEnd = formatLocalDateTime(middle + radius);
+      return;
+    }
+    const minutes = chartTimeRange === 'all' ? 1440 : Number(chartTimeRange);
+    chartTimeRange = String(Math.max(1, Math.min(10080, Math.round(minutes * (inward ? 0.5 : 2)))));
+  }
+
+  function formatChartTime(time: number) {
+    return new Date(time).toLocaleString('ja-JP', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  }
+
+  function formatLocalDateTime(time: number) {
+    const date = new Date(time);
+    return new Date(time - date.getTimezoneOffset() * 60_000).toISOString().slice(0, 16);
+  }
   let preventSleep = true;
   let mediaSessionSupported = false;
   let showConnectionModal = false;
@@ -82,8 +183,14 @@
     updateEndpoint();
     try { preventSleep = localStorage.getItem('ecorun-prevent-sleep') !== 'false'; } catch { /* storage may be unavailable */ }
     try {
+      forwardToLogger = localStorage.getItem('ecorun-forward-to-logger') !== 'false';
+      const storedBitrate = Number(localStorage.getItem('ecorun-receive-bitrate'));
+      const storedFrame = Number(localStorage.getItem('ecorun-receive-frame-ms'));
+      if (RECEIVE_BITRATES.includes(storedBitrate)) receiveBitrate = storedBitrate;
+      if (RECEIVE_FRAME_MS.includes(storedFrame)) receiveFrameMs = storedFrame;
       mapVisible = localStorage.getItem('ecorun-map-visible') === 'true';
       telemetryVisible = localStorage.getItem('ecorun-telemetry-visible') === 'true';
+
     } catch { /* storage may be unavailable */ }
     mediaSessionSupported = 'mediaSession' in navigator;
     updateMediaSession();
@@ -303,107 +410,241 @@
   }
 
   function sendControl(message: object) {
-    if (!ws?.connected) return;
     const value = message as Record<string, unknown>;
-    if (value.type === 'audio.mute') ws.emit('audio.mute', { muted: value.muted });
-    else if (value.type === 'audio.ptt') ws.emit('audio.ptt', { active: value.active });
+    for (const socket of sockets) {
+      if (!socket.connected) continue;
+      if (value.type === 'audio.mute') socket.emit('audio.mute', { muted: value.muted });
+      else if (value.type === 'audio.ptt') socket.emit('audio.ptt', { active: value.active });
+    }
   }
 
-  async function initializeConnectedSession() {
-    status = 'connected';
-    updateMediaSession();
-    errorMessage = '';
-    sessionId = null; participants = [];
-    await setupDecoder();
-    await setupAudioCapture();
-    if (shareLocation) startLocationUpdates();
-    if (preventSleep) await acquireWakeLock();
+  function sendAudioPreferences(socket?: Socket) {
+    for (const peer of socket ? [socket] : sockets) {
+      if (!peer.connected) continue;
+      peer.emit('audio.forward_logger', { enabled: forwardToLogger });
+      peer.emit('audio.receive_config', { bitrate: receiveBitrate, frame_ms: receiveFrameMs });
+    }
   }
 
-  function attachPrimaryHandlers(socket: Socket, generation: number) {
-    socket.on('connect', () => {
-      if (generation !== connectionGeneration) return;
-      stopFailover();
-      void initializeConnectedSession();
-    });
-    socket.on('connect_error', (error) => {
-      if (generation !== connectionGeneration) return;
-      status = 'reconnecting'; errorMessage = `Socket.IO接続エラー: ${error.message}`;
-      scheduleFailover(socket);
-    });
-    socket.on('disconnect', (reason) => {
-      if (generation !== connectionGeneration) return;
-      status = 'reconnecting'; stopAudioCapture(); ptt = false; keyboardPttHeld = false;
-      updateMediaSession();
-      void releaseWakeLock();
-      decoder?.close(); decoder = null;
-      if (reason === 'io server disconnect') errorMessage = 'サーバーが接続を終了しました。再接続してください';
-      scheduleFailover(socket);
-    });
-      socket.on('hello', (event) => handleEvent({ type: 'hello', ...event }));
-      socket.on('audio.config', (event) => handleEvent({ type: 'audio.config', ...event }));
-      socket.on('room.state', (event) => handleEvent({ type: 'room.state', ...event }));
-      socket.on('map.state', (event) => { mapConfig = event; renderMap(); });
-      socket.on('participant.joined', (participant) => updateParticipant(participant));
-      socket.on('participant.updated', (participant) => updateParticipant(participant));
-      socket.on('participant.left', ({ session_id }) => { participants = participants.filter((p) => String(p.session_id) !== String(session_id)); });
-      socket.on('audio.packet', async (packet: ArrayBuffer | Uint8Array | Blob) => {
-        let bytes: Uint8Array;
-        if (packet instanceof Blob) bytes = new Uint8Array(await packet.arrayBuffer());
-        else if (packet instanceof ArrayBuffer) bytes = new Uint8Array(packet);
-        else bytes = packet;
-        receivedPacketCount++;
-        await decodePacket(bytes);
+  function applyAudioPreferences() {
+    try {
+      localStorage.setItem('ecorun-forward-to-logger', String(forwardToLogger));
+      localStorage.setItem('ecorun-receive-bitrate', String(receiveBitrate));
+      localStorage.setItem('ecorun-receive-frame-ms', String(receiveFrameMs));
+    } catch { /* storage may be unavailable */ }
+    sendAudioPreferences();
+  }
+
+  async function loadTelemetryHistory() {
+    if (historyLoading) return;
+    historyLoading = true;
+    historyStatus = '';
+    activeSocket?.emit('telemetry.request');
+    const target = activeSocket ? socketTargets.get(activeSocket) : (endpoint || location.origin);
+    const room = roomId.trim() || 'main';
+    try {
+      const params = new URLSearchParams();
+      if (chartTimeRange === 'custom') {
+        if (customRangeStart) params.set('since', new Date(customRangeStart).toISOString());
+        if (customRangeEnd) params.set('until', new Date(customRangeEnd).toISOString());
+      }
+      const response = await fetch(`${target}/api/rooms/${encodeURIComponent(room)}/telemetry?${params}`, {
+        cache: 'no-store',
+        headers: socketToken ? { authorization: `Bearer ${socketToken}` } : undefined
       });
-      socket.on('telemetry', (event) => { if (generation === connectionGeneration) handleEvent({ ...event, type: 'telemetry' }); });
-      socket.on('error', (event) => handleEvent({ type: 'error', ...event }));
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const events = await response.json();
+      if (!Array.isArray(events)) throw new Error('履歴の形式が正しくありません');
+      if (room === (roomId.trim() || 'main')) {
+        for (const event of events) if (event && typeof event.source === 'string' && event.data && typeof event.data === 'object') {
+          handleEvent({ type: 'telemetry', ...event });
+        }
+      }
+      historyStatus = `履歴を${events.length}件読み込みました（最大5000件）。`;
+    } catch (error) {
+      historyStatus = `履歴HTTP取得不可 (${error})。Socket.IOで直近のデータを再取得しました。`;
+    } finally {
+      historyLoading = false;
+    }
   }
 
-  async function connect(targetEndpoint?: string) {
-    if (ws) disconnect();
+  function connectionTargets() {
+    const configured = servers.filter((server) => server.available).map((server) => (server.url || location.origin).replace(/\/$/, ''));
+    return [...new Set([...configured, ...(endpoint ? [endpoint.replace(/\/$/, '')] : []), location.origin.replace(/\/$/, '')])];
+  }
+
+  // Keep all nodes connected for fast failover, but show/play/transmit only
+  // through the node that currently has the logger for this room.
+  function chooseActiveServer() {
+    const connected = sockets.filter((candidate) => candidate.connected);
+    const present = connected.filter((candidate) => loggerPresence.get(candidate) === true);
+    let next = activeSocket?.connected && (loggerPresence.get(activeSocket) === true || !present.length)
+      ? activeSocket : (present[0] ?? connected[0] ?? null);
+    // Allow immediate failover after a transport disconnect. If the current
+    // transport still works, wait for the other node's logger presence to be
+    // stable to prevent LTE flapping from bouncing the pit display.
+    if (activeSocket?.connected && next && next !== activeSocket && present.includes(next)
+      && Date.now() - (loggerPresenceSince.get(next) ?? Date.now()) < LOGGER_SWITCH_STABLE_MS) {
+      next = activeSocket;
+    }
+    if (activeSocket !== next) {
+      activeSocket = next;
+      // Preserve already displayed events across failover. The new node's
+      // telemetry.state will merge into the same deduplicated timeline.
+      receivedAudioKeys.clear();
+      if (next) {
+        next.emit('telemetry.request');
+        next.emit('map.request');
+      }
+      renderMap();
+    }
+    const url = activeSocket ? socketTargets.get(activeSocket) : undefined;
+    activeServerName = servers.find((server) => (server.url || location.origin).replace(/\/$/, '') === url)?.name ?? (url || '未接続');
+    activeLoggerConnected = !!activeSocket && loggerPresence.get(activeSocket) === true;
+  }
+
+  async function connect() {
+    if (sockets.length) disconnect();
     errorMessage = '';
     status = 'connecting';
-    if (!targetEndpoint) updateEndpoint();
-    activeEndpoint = targetEndpoint ?? endpoint;
-    endpoint = activeEndpoint;
-    const generation = ++connectionGeneration;
     logBrowserDiagnostics('connect');
     try {
-      const socket = io(`${activeEndpoint}/${encodeURIComponent(roomId.trim() || 'main')}`, {
-        path: '/socket.io/', transports: ['websocket', 'polling'],
-        auth: { token: socketToken },
-        reconnection: true, reconnectionAttempts: Infinity,
-        reconnectionDelay: 500, reconnectionDelayMax: 10000, randomizationFactor: 0.5
+      sockets = connectionTargets().map((target) => {
+        const socket = io(`${target}/${encodeURIComponent(roomId.trim() || 'main')}`, {
+          // Cross-origin standby hosts can be reached directly over WebSocket;
+          // HTTP polling would additionally require CORS preflight handling.
+          path: '/socket.io/', transports: ['websocket'],
+          auth: { token: socketToken },
+          reconnection: true, reconnectionAttempts: Infinity,
+          reconnectionDelay: 500, reconnectionDelayMax: 10000, randomizationFactor: 0.5,
+        });
+        socketTargets.set(socket, target);
+        socket.on('connect', async () => {
+          connectedSocketCount += 1;
+          socket.emit('client.identify', { client_id: clientId });
+          socket.emit('audio.mute', { muted });
+          socket.emit('audio.ptt', { active: ptt && !muted });
+          sendAudioPreferences(socket);
+          status = 'connected';
+          chooseActiveServer();
+          // If the standby missed edits while offline, copy the active
+          // room map to it when it becomes reachable again.
+          if (mapStateReceived && activeSocket !== socket && activeSocket?.connected) {
+            socket.emit('map.update', mapConfig);
+          }
+          updateMediaSession();
+          errorMessage = '';
+          if (connectedSocketCount === 1) {
+            await setupDecoder();
+            await setupAudioCapture();
+            if (shareLocation) startLocationUpdates();
+          }
+          if (preventSleep) await acquireWakeLock();
+        });
+        socket.on('connect_error', (error) => {
+          if (!sockets.some((candidate) => candidate.connected)) status = 'reconnecting';
+          errorMessage = `Socket.IO接続エラー: ${error.message}`;
+        });
+        socket.on('disconnect', (reason) => {
+          connectedSocketCount = Math.max(0, connectedSocketCount - 1);
+          nodeParticipants.delete(socket);
+          loggerPresence.delete(socket);
+          loggerPresenceSince.delete(socket);
+          chooseActiveServer();
+          refreshParticipants();
+          if (connectedSocketCount === 0) {
+            stopLocationUpdates();
+            status = 'reconnecting'; stopAudioCapture(); ptt = false; keyboardPttHeld = false;
+            updateMediaSession(); void releaseWakeLock(); decoder?.close(); decoder = null;
+          }
+          if (reason === 'io server disconnect' && connectedSocketCount === 0) errorMessage = 'すべてのLoggerサーバーが接続を終了しました。';
+        });
+        socket.on('hello', (event) => handleEvent({ type: 'hello', ...event }));
+        socket.on('logger.status', (event: { connected?: boolean }) => {
+          const present = event.connected === true;
+          if (present && loggerPresence.get(socket) !== true) loggerPresenceSince.set(socket, Date.now());
+          if (!present) loggerPresenceSince.delete(socket);
+          loggerPresence.set(socket, present);
+          chooseActiveServer();
+        });
+        socket.on('audio.config', (event) => handleEvent({ type: 'audio.config', ...event }));
+        socket.on('room.state', (event: { participants?: Participant[] }) => {
+          nodeParticipants.set(socket, new Map((event.participants ?? []).map((participant) => [String(participant.session_id), participant])));
+          refreshParticipants();
+        });
+        socket.on('telemetry.state', (events: Telemetry[]) => { if (activeSocket === socket) events.forEach((event) => handleEvent({ type: 'telemetry', ...event })); });
+        socket.on('telemetry', (event) => { if (activeSocket === socket) handleEvent({ type: 'telemetry', ...event }); });
+        socket.on('map.state', (event) => { if (activeSocket === socket) { mapConfig = event; mapStateReceived = true; renderMap(); } });
+        socket.on('participant.joined', (participant: Participant) => updateNodeParticipant(socket, participant));
+        socket.on('participant.updated', (participant: Participant) => updateNodeParticipant(socket, participant));
+        socket.on('participant.left', ({ session_id }: { session_id: string }) => {
+          nodeParticipants.get(socket)?.delete(String(session_id));
+          refreshParticipants();
+        });
+        socket.on('audio.packet', async (senderId: string, senderSequence: number, packet: ArrayBuffer | Uint8Array | Blob) => {
+          if (activeSocket !== socket) return;
+          const key = `${senderId}:${senderSequence}`;
+          if (receivedAudioKeys.has(key)) return;
+          receivedAudioKeys.add(key);
+          if (receivedAudioKeys.size > 4096) receivedAudioKeys.clear();
+          let bytes: Uint8Array;
+          if (packet instanceof Blob) bytes = new Uint8Array(await packet.arrayBuffer());
+          else if (packet instanceof ArrayBuffer) bytes = new Uint8Array(packet);
+          else bytes = packet;
+          receivedPacketCount++;
+          await decodePacket(bytes);
+        });
+        socket.on('error', (event) => handleEvent({ type: 'error', ...event }));
+        return socket;
       });
-      ws = socket;
-      attachPrimaryHandlers(socket, generation);
+
     } catch (error) { status = 'disconnected'; errorMessage = String(error); }
   }
 
-  function updateParticipant(participant: Participant) {
-    participants = [...participants.filter((p) => String(p.session_id) !== String(participant.session_id)), participant];
+  function updateNodeParticipant(socket: Socket, participant: Participant) {
+    if (!nodeParticipants.has(socket)) nodeParticipants.set(socket, new Map());
+    nodeParticipants.get(socket)!.set(String(participant.session_id), participant);
+    refreshParticipants();
+  }
+
+  function refreshParticipants() {
+    const unique = new Map<string, Participant>();
+    for (const members of nodeParticipants.values()) {
+      for (const participant of members.values()) {
+        const key = participant.client_id || String(participant.session_id);
+        const existing = unique.get(key);
+        if (!existing || (participant.client_id && !existing.client_id)) unique.set(key, participant);
+      }
+    }
+    participants = [...unique.values()];
   }
 
   function handleEvent(event: any) {
-    if (event.type === 'hello') sessionId = event.session_id ?? null;
-    if (event.type === 'room.state') participants = event.participants ?? [];
+    if (event.type === 'hello') { /* Connection is identified by the stable client ID. */ }
     if (event.type === 'telemetry') {
-      const item = { source: event.source ?? 'unknown', timestamp: event.timestamp, data: event.data ?? {} };
-      if (telemetryVisible) telemetry = [item, ...telemetry].slice(0, 12);
-      const position = findPosition(item.data);
-      if (position) {
-        const session = String(event.session_id ?? item.data.session_id ?? item.data.id ?? item.source);
-        loggerPositions = [...loggerPositions.filter((entry) => entry.session !== session), { session, ...position, data: item.data }];
-        renderMap();
+      const item: Telemetry = { event_id: event.event_id, source: event.source ?? 'unknown', timestamp: event.timestamp, received_at: event.received_at ?? Date.now(), data: event.data ?? {} };
+      const key = item.event_id ?? `${item.source}:${item.timestamp ?? ''}:${JSON.stringify(item.data)}`;
+      if (!telemetryKeys.has(key)) {
+        telemetryKeys.add(key);
+        if (telemetryKeys.size > 1000) telemetryKeys.clear();
+        if (telemetryVisible) telemetry = [item, ...telemetry].slice(0, 5000);
+        const position = findPosition(item.data);
+        if (position) {
+          const session = String(item.data.session_id ?? item.data.id ?? item.source);
+          loggerPositions = [...loggerPositions.filter((entry) => entry.session !== session), { session, ...position, data: item.data }];
+          renderMap();
+        }
+
       }
     }
     if (event.type === 'error') errorMessage = event.message ?? event.code ?? 'server error';
   }
 
   function findPosition(data: Record<string, unknown>) {
-    // Loggers use Podium's channel names (Latitude/Longitude).
-    const lat = Number(data.lat ?? data.latitude ?? data.Latitude ?? data.gps_lat ?? data.gnss_lat);
-    const lon = Number(data.lon ?? data.lng ?? data.longitude ?? data.Longitude ?? data.gps_lon ?? data.gnss_lon);
+    const normalized = new Map(Object.entries(data).map(([key, value]) => [key.replace(/[^a-z\d]/gi, '').toLowerCase(), value]));
+    const lat = Number(normalized.get('lat') ?? normalized.get('latitude') ?? normalized.get('gpslat') ?? normalized.get('gnsslat'));
+    const lon = Number(normalized.get('lon') ?? normalized.get('lng') ?? normalized.get('longitude') ?? normalized.get('gpslon') ?? normalized.get('gnsslon'));
+
     return Number.isFinite(lat) && Number.isFinite(lon) && Math.abs(lat) <= 90 && Math.abs(lon) <= 180 ? { lat, lon } : null;
   }
 
@@ -423,8 +664,9 @@
     if (!mapInstance) return;
     const center = mapInstance.getCenter();
     mapConfig = { ...mapConfig, center_lat: center.lat, center_lon: center.lng, zoom: mapInstance.getZoom() };
-    if (ws?.connected) {
-      ws.emit('map.update', mapConfig);
+    mapStateReceived = true;
+    if (sockets.some((socket) => socket.connected)) {
+      for (const socket of sockets) if (socket.connected) socket.emit('map.update', mapConfig);
       return;
     }
     try {
@@ -560,7 +802,9 @@
     try {
       decoder.decode(new EncodedAudioChunk({ type: 'key', timestamp: decodeTimestamp, data: packet }));
       //console.debug('[audio diagnostics] packet queued for decode', { byteLength: packet.byteLength, timestamp: decodeTimestamp, decodeQueueSize: decoder.decodeQueueSize });
-      decodeTimestamp += 60_000;
+      // The server adapts packet duration to the receiver's requested frame
+      // size. The Opus decoder itself determines the actual decoded samples.
+      decodeTimestamp += receiveFrameMs * 1_000;
     } catch (error) {
       console.error('[audio diagnostics] decoder.decode threw', { error, byteLength: packet.byteLength, decoderState: decoder.state });
       errorMessage = `Opus packet decode failed: ${error}`;
@@ -568,7 +812,7 @@
   }
 
   async function setPtt(value: boolean) {
-    if (value && (!ws?.connected || muted || !mediaStream || !encoder || encoder.state !== 'configured')) return;
+    if (value && (!sockets.some((socket) => socket.connected) || muted || !mediaStream || !encoder || encoder.state !== 'configured')) return;
     ptt = value;
     updateMediaSession();
     sendControl({ type: 'audio.ptt', active: value });
@@ -589,7 +833,8 @@
       myPosition = { lat: position.coords.latitude, lon: position.coords.longitude, accuracy: position.coords.accuracy };
       locationError = '';
       renderMap();
-      sendTelemetry({ source: 'web-client', timestamp: new Date(position.timestamp).toISOString(), data: { latitude: position.coords.latitude, longitude: position.coords.longitude, accuracy_m: position.coords.accuracy } });
+      if (activeSocket?.connected) activeSocket.emit('telemetry', { source: 'web-client', timestamp: new Date(position.timestamp).toISOString(), data: { latitude: position.coords.latitude, longitude: position.coords.longitude, accuracy_m: position.coords.accuracy } });
+
     }, (error) => {
       locationError = `現在地を取得できません: ${error.message}`;
     }, { enableHighAccuracy: false, maximumAge: 30000, timeout: 10000 });
@@ -634,6 +879,8 @@
     if (value) {
       ptt = false;
       stopAudioCapture();
+    } else if (status === 'connected') {
+      void setupAudioCapture();
     }
   }
 
@@ -661,9 +908,9 @@
   }
 
   async function setupAudioCapture() {
-    if (!ws?.connected) return;
-    if (captureSetupPromise) await captureSetupPromise;
-    if (!ws?.connected) return;
+    if (!sockets.some((socket) => socket.connected)) return;
+    if (captureSetupPromise) { await captureSetupPromise; return; }
+    if (!sockets.some((socket) => socket.connected) || encoder) return;
     const generation = captureGeneration;
     const setup = (async () => {
       const diagnostics = logBrowserDiagnostics('setup-audio-capture');
@@ -674,17 +921,17 @@
       }
       audioContext ??= new AudioContext();
       await audioContext.resume();
-      if (!ws?.connected) return;
+      if (!sockets.some((socket) => socket.connected)) return;
       console.info('[audio diagnostics] AudioContext ready', { state: audioContext.state, sampleRate: audioContext.sampleRate });
       const stream = await navigator.mediaDevices.getUserMedia({ audio: { ...(selectedInputDevice ? { deviceId: { exact: selectedInputDevice } } : {}), channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
-      if (!ws?.connected || generation !== captureGeneration) {
+      if (!sockets.some((socket) => socket.connected) || generation !== captureGeneration) {
         stream.getTracks().forEach((track) => track.stop());
         return;
       }
       mediaStream = stream;
       stream.getAudioTracks().forEach((track) => { track.enabled = false; });
       await refreshAudioDevices();
-      if (!ws?.connected || generation !== captureGeneration || mediaStream !== stream) {
+      if (!sockets.some((socket) => socket.connected) || generation !== captureGeneration || mediaStream !== stream) {
         stream.getTracks().forEach((track) => track.stop());
         if (mediaStream === stream) mediaStream = null;
         return;
@@ -698,7 +945,10 @@
         output: (chunk) => {
           const data = new Uint8Array(chunk.byteLength); chunk.copyTo(data);
           //console.debug('[audio diagnostics] encoded Opus chunk', { byteLength: chunk.byteLength, timestamp: chunk.timestamp, duration: chunk.duration, type: chunk.type });
-          if (ws?.connected) ws.emit('audio.packet', data);
+          if (sockets.some((socket) => socket.connected)) {
+            const packetSequence = sequence++;
+            if (activeSocket?.connected) activeSocket.emit('audio.packet', { client_id: clientId, sequence: packetSequence, packet: data });
+          }
         },
         error: (error) => { console.error('[audio diagnostics] Opus encoder error', error); errorMessage = `Opus encode error: ${error}`; }
       });
@@ -719,7 +969,7 @@
       } else {
         console.warn('[audio diagnostics] AudioEncoder.isConfigSupported unavailable');
       }
-      if (!ws?.connected || generation !== captureGeneration) {
+      if (!sockets.some((socket) => socket.connected) || generation !== captureGeneration) {
         nextEncoder.close();
         stream.getTracks().forEach((track) => track.stop());
         return;
@@ -798,11 +1048,14 @@
   }
 
   function disconnect() {
-    connectionGeneration++;
-    if (failoverTimer) clearTimeout(failoverTimer);
-    failoverTimer = null;
-    stopFailover();
-    keyboardPttHeld = false; ptt = false; sendControl({ type: 'audio.ptt', active: false }); stopAudioCapture(); stopLocationUpdates(); void releaseWakeLock(); ws?.disconnect(); ws = null; status = 'disconnected'; updateMediaSession();
+    keyboardPttHeld = false; ptt = false; sendControl({ type: 'audio.ptt', active: false });
+    stopAudioCapture(); stopLocationUpdates(); void releaseWakeLock();
+    sockets.forEach((socket) => socket.disconnect()); sockets = []; nodeParticipants.clear();
+    activeSocket = null; activeServerName = ''; activeLoggerConnected = false; socketTargets.clear(); loggerPresence.clear(); loggerPresenceSince.clear(); mapStateReceived = false;
+    participants = []; connectedSocketCount = 0; receivedAudioKeys.clear(); telemetryKeys.clear();
+    telemetry = []; loggerPositions = []; metricSelectionInitialized = false; chosenMetrics = []; historyStatus = '';
+    decoder?.close(); decoder = null; status = 'disconnected'; updateMediaSession();
+
   }
 
   function joinRoom() {
@@ -827,19 +1080,88 @@
 </svelte:head>
 
 <main>
-  <header><div><p class="eyebrow">ECORUN LOGGER</p><h1>Voice & telemetry</h1><p class="room-subtitle">Room: <strong>{roomId}</strong></p></div><div class="header-actions"><span class:online={status === 'connected'} class="status">{status}</span><button class="secondary compact" on:click={() => showConnectionModal = true}>Connection</button><button class="secondary compact" on:click={() => showAudioModal = true}>Audio</button></div></header>
+  <header><div><p class="eyebrow">ECORUN LOGGER</p><h1>Voice & telemetry</h1><p class="room-subtitle">Room: <strong>{roomId}</strong> · 表示・通話先: <strong>{activeServerName || '未接続'}</strong> {#if status === 'connected'}({activeLoggerConnected ? 'ロガー接続中' : 'ロガー待機中 / Podium直接送信の可能性'}){/if}</p></div><div class="header-actions"><span class:online={status === 'connected'} class="status">{status}</span><button class="secondary compact" on:click={() => showConnectionModal = true}>Connection</button><button class="secondary compact" on:click={() => showAudioModal = true}>Audio</button></div></header>
   {#if errorMessage}<p class="error top-error">{errorMessage}</p>{/if}
   <section class="grid">
-    <article class="card ptt-card"><div><p class="eyebrow">PUSH TO TALK</p><h2>{muted ? 'Muted' : ptt ? 'Transmitting' : 'Ready'}</h2><p>Session {sessionId ?? '—'} · {participants.length} participant{participants.length === 1 ? '' : 's'}</p></div><button class:active={ptt} class="ptt" disabled={status !== 'connected' || muted} on:pointerdown={() => setPtt(true)} on:pointerup={() => setPtt(false)} on:pointercancel={() => setPtt(false)} on:pointerleave={() => setPtt(false)}> {ptt ? 'RELEASE' : 'HOLD TO TALK'} </button><button class="secondary" disabled={status !== 'connected'} on:click={() => setMute(!muted)}>{muted ? 'Unmute' : 'Mute'}</button><small>Spaceキーでも送信できます</small></article>
-    <article class="card"><p class="eyebrow">ROOM</p><h2>{roomId}</h2>{#if participants.length}<ul class="participants">{#each participants as participant}<li><span class:me={participant.session_id === sessionId}>● Session {participant.session_id}</span>{participant.muted ? ' · muted' : participant.ptt ? ' · talking' : ' · ready'}</li>{/each}</ul>{:else}<p class="muted">参加者なし</p>{/if}
+    <article class="card ptt-card"><div><p class="eyebrow">PUSH TO TALK</p><h2>{muted ? 'Muted' : ptt ? 'Transmitting' : 'Ready'}</h2><p>Client {clientId.slice(0, 8)} · {participants.length} participant{participants.length === 1 ? '' : 's'}</p></div><button class:active={ptt} class="ptt" disabled={status !== 'connected' || muted} on:pointerdown={() => setPtt(true)} on:pointerup={() => setPtt(false)} on:pointercancel={() => setPtt(false)} on:pointerleave={() => setPtt(false)}> {ptt ? 'RELEASE' : 'HOLD TO TALK'} </button><button class="secondary" disabled={status !== 'connected'} on:click={() => setMute(!muted)}>{muted ? 'Unmute' : 'Mute'}</button><small>Spaceキーでも送信できます</small></article>
+    <article class="card"><p class="eyebrow">ROOM</p><h2>{roomId}</h2>{#if participants.length}<ul class="participants">{#each participants as participant}<li><span class:me={participant.client_id === clientId}>● {participant.client_id ? `Client ${participant.client_id.slice(0, 8)}` : `Session ${participant.session_id}`}</span>{participant.muted ? ' · muted' : participant.ptt ? ' · talking' : ' · ready'}</li>{/each}</ul>{:else}<p class="muted">参加者なし</p>{/if}
       <p class="hint">Audio settings are available from the Audio button.</p>
     </article>
   </section>
   <section class="card map-card"><div class="section-title"><div><p class="eyebrow">LIVE MAP</p><h2>Logger positions & plots</h2></div><div class="map-actions"><button class="secondary compact" aria-expanded={mapVisible} on:click={toggleMap}>{mapVisible ? 'マップを非表示' : 'マップを表示'}</button>{#if mapVisible}<button class="secondary compact" on:click={showMyLocation}>現在地</button><button class="secondary compact" on:click={() => startDrawing('point')}>Add point</button><button class="secondary compact" on:click={() => startDrawing('line')}>Draw line</button>{#if drawingKind}<button class="compact" on:click={finishDrawing}>Finish</button><button class="secondary compact" on:click={() => { drawingKind = null; drawingCoordinates = []; renderMap(); }}>Cancel</button>{/if}{/if}</div></div><div class="map" class:map-hidden={!mapVisible} use:initMap></div>{#if mapVisible}<p class="hint">現在地は「位置情報を1分ごとに送信する」を有効にすると地図上に表示されます。「現在地」で一度だけ取得して地図を移動することもできます。</p>{#if locationError}<p class="error">{locationError}</p>{/if}{#if mapConfig.plots.length}<div class="plot-list"><p class="hint">保存済みの線・ポイント（削除するとルーム内の全員に反映されます）</p>{#each mapConfig.plots as plot, index (plot.id)}<div class="plot-row"><span>{plot.kind === 'line' ? '線' : 'ポイント'} {index + 1}{plot.label ? ` · ${plot.label}` : ''} <small>({plot.coordinates.length}地点)</small></span><button class="secondary compact" aria-label={`${plot.kind === 'line' ? '線' : 'ポイント'} ${index + 1}を削除`} on:click={() => deletePlot(plot.id)}>削除</button></div>{/each}</div>{/if}{/if}</section>
-  <section class="card telemetry"><div class="section-title"><div><p class="eyebrow">TELEMETRY</p><h2>Latest events</h2></div><div class="map-actions"><span class="telemetry-count">{telemetry.length}</span><button class="secondary compact" aria-expanded={telemetryVisible} on:click={toggleTelemetry}>{telemetryVisible ? 'メトリクスを非表示' : 'メトリクスを表示'}</button></div></div>{#if telemetryVisible}{#if telemetry.length}<div class="events">{#each telemetry as event}<article><strong>{event.source}</strong><time>{event.timestamp ?? 'no timestamp'}</time><pre>{JSON.stringify(event.data, null, 2)}</pre></article>{/each}</div>{:else}<p class="muted">telemetryイベントを待っています</p>{/if}{/if}</section>
+  <section class="card telemetry"><div class="map-actions"><button class="secondary compact" aria-expanded={telemetryVisible} on:click={toggleTelemetry}>{telemetryVisible ? 'メトリクスを非表示' : 'メトリクスを表示'}</button></div>{#if telemetryVisible}
+    <div class="section-title"><div><p class="eyebrow">TELEMETRY</p><h2>Metrics timeline</h2></div><span>{telemetry.length} 件保持</span></div>
+    <div class="chart-controls">
+      <label>表示期間
+        <select bind:value={chartTimeRange}>
+          <option value="5">直近5分</option><option value="30">直近30分</option><option value="120">直近2時間</option>
+          <option value="1440">直近24時間</option><option value="all">保持中の全期間</option><option value="custom">日時指定</option>
+        </select>
+      </label>
+      <button class="secondary compact" on:click={() => zoomChart(true)} aria-label="時間軸を拡大">拡大 +</button>
+      <button class="secondary compact" on:click={() => zoomChart(false)} aria-label="時間軸を縮小">縮小 −</button>
+      <button class="secondary compact" on:click={loadTelemetryHistory} disabled={historyLoading}>{historyLoading ? '取得中…' : '履歴検索 / 更新'}</button>
+    </div>
+    {#if chartTimeRange === 'custom'}
+      <div class="chart-controls date-controls">
+        <label>開始日時<input type="datetime-local" bind:value={customRangeStart} /></label>
+        <label>終了日時<input type="datetime-local" bind:value={customRangeEnd} /></label>
+      </div>
+    {/if}
+    {#if historyStatus}<p class="hint" role="status">{historyStatus}</p>{/if}
+    {#if availableMetrics.length}
+      <div class="metric-picker">
+        <label>表示項目を検索<input type="search" bind:value={metricSearch} placeholder="例: Speed, Latitude" /></label>
+        <div class="metric-options">
+          {#each filteredMetricOptions as metric (metric)}
+            <label class="metric-option"><input type="checkbox" checked={chosenMetrics.includes(metric)} on:change={(event) => setMetricVisible(metric, (event.currentTarget as HTMLInputElement).checked)} />{metric}</label>
+          {/each}
+        </div>
+      </div>
+      {#if charts.length}
+        <div class="charts">
+          {#each charts as chart (chart.metric)}
+            <article class="chart">
+              <div class="section-title"><strong>{chart.metric}</strong><span>{chart.latest ?? '—'} · {chart.count}点</span></div>
+              <svg viewBox="0 0 500 150" preserveAspectRatio="none" role="img" aria-label={`${chart.metric} 時系列グラフ`}>
+                <line x1="24" y1="20" x2="476" y2="20" stroke="#30363d" />
+                <line x1="24" y1="78" x2="476" y2="78" stroke="#30363d" />
+                <line x1="24" y1="136" x2="476" y2="136" stroke="#58606d" />
+                <polyline fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" points={chart.points} />
+              </svg>
+              <div class="chart-axis"><time>{formatChartTime(chartBounds.start)}</time><time>{formatChartTime(chartBounds.end)}</time></div>
+              <p class="chart-values">最小 {chart.count ? chart.min : '—'} / 最大 {chart.count ? chart.max : '—'}{chart.count ? '' : ' · この期間に記録なし'}</p>
+            </article>
+          {/each}
+        </div>
+      {:else}<p class="muted">表示項目を選択してください</p>{/if}
+    {:else}<p class="muted">数値telemetryイベントを待っています</p>{/if}
+    {#if telemetry.length}<div class="events">{#each telemetry.slice(0, 12) as event}<article><strong>{event.source}</strong><time>{event.timestamp ?? event.received_at ?? 'no timestamp'}</time><pre>{JSON.stringify(event.data, null, 2)}</pre></article>{/each}</div>{/if}
+  {/if}</section>
+
 
   {#if showConnectionModal}<div class="modal-backdrop" role="presentation" on:click={(event) => { if (event.currentTarget === event.target) showConnectionModal = false; }}><section class="modal" role="dialog" aria-modal="true"><div class="section-title"><div><p class="eyebrow">CONNECTION</p><h2>Room & server</h2></div><button class="secondary compact" on:click={() => showConnectionModal = false}>Close</button></div><label>Logger server<select bind:value={selectedServer} on:change={updateEndpoint}>{#each servers as server}<option value={server.id} disabled={!server.available}>{server.name} {server.available ? '' : '(unavailable)'}</option>{/each}</select></label><label>Server URL<input bind:value={endpoint} /></label><label>Room<select bind:value={roomId}>{#each rooms as room}<option value={room.id}>{room.name} ({room.id})</option>{/each}</select></label><label>Room key<input type="password" bind:value={socketToken} autocomplete="off" placeholder="TUIで発行したroom key" /></label><div class="row"><button on:click={joinRoom}>{status === 'connected' ? 'Switch room' : 'Connect'}</button>{#if status === 'connected' || status === 'reconnecting'}<button class="secondary" on:click={disconnect}>Disconnect</button>{/if}</div><label class="setting"><input type="checkbox" checked={preventSleep} on:change={(event) => setPreventSleep((event.currentTarget as HTMLInputElement).checked)} /> 接続中は画面スリープを防止する</label><label class="setting"><input type="checkbox" checked={shareLocation} on:change={(event) => setShareLocation((event.currentTarget as HTMLInputElement).checked)} /> 位置情報を1分ごとに送信する</label><p class="hint">{mediaSessionSupported ? 'Media Session API対応ブラウザです。' : 'Media Session APIは利用できません。'} 位置情報はブラウザの許可が必要です。</p></section></div>{/if}
-  {#if showAudioModal}<div class="modal-backdrop" role="presentation" on:click={(event) => { if (event.currentTarget === event.target) showAudioModal = false; }}><section class="modal" role="dialog" aria-modal="true"><div class="section-title"><div><p class="eyebrow">AUDIO</p><h2>Voice settings</h2></div><button class="secondary compact" on:click={() => showAudioModal = false}>Close</button></div><label class="volume">Speaker volume ({Math.round(volume * 100)}%)<input type="range" min="0" max="2" step="0.05" value={volume} on:input={(event) => setVolume(Number((event.currentTarget as HTMLInputElement).value))} /></label><label class="volume">Microphone<select class="device-select" bind:value={selectedInputDevice} on:change={changeInputDevice}><option value="">Default microphone</option>{#each inputDevices as device}<option value={device.deviceId}>{device.label || `Microphone ${device.deviceId.slice(0, 8)}`}</option>{/each}</select></label><label class="volume">Mic volume ({Math.round(micVolume * 100)}%)<input type="range" min="0" max="2" step="0.05" value={micVolume} on:input={(event) => setMicVolume(Number((event.currentTarget as HTMLInputElement).value))} /></label><label class="volume">Mic boost ({micBoost.toFixed(1)}×)<input type="range" min="1" max="4" step="0.25" value={micBoost} on:input={(event) => setMicBoost(Number((event.currentTarget as HTMLInputElement).value))} /></label><label class="volume">Opus sample rate<select bind:value={opusSampleRate} on:change={applyAudioEncoderSettings}>{#each OPUS_SAMPLE_RATES as rate}<option value={rate}>{rate / 1000} kHz</option>{/each}</select></label><label class="volume">Opus frame duration<select bind:value={opusFrameMs} on:change={applyAudioEncoderSettings}>{#each OPUS_FRAME_MS as frameMs}<option value={frameMs}>{frameMs} ms</option>{/each}</select></label><label class="volume">Opus bitrate<select bind:value={opusBitrate} on:change={applyAudioEncoderSettings}>{#each [4000, 6000, 8000, 12000, 16000, 24000, 32000] as bitrate}<option value={bitrate}>{bitrate / 1000} kbps</option>{/each}</select></label><label class="volume">Speaker output{#if outputSelectionSupported}<select bind:value={selectedOutputDevice} on:change={selectOutputDevice}><option value="">Default speaker</option>{#each outputDevices as device}<option value={device.deviceId}>{device.label || `Speaker ${device.deviceId.slice(0, 8)}`}</option>{/each}</select>{:else}<select disabled><option>Switching unsupported</option></select>{/if}</label><p class="hint">Opus設定はWebCodecsの送信側だけに適用します。サーバー側は8 kHz monoへ変換して既存の音声経路を維持します。</p></section></div>{/if}
+  {#if showAudioModal}
+    <div class="modal-backdrop" role="presentation" on:click={(event) => { if (event.currentTarget === event.target) showAudioModal = false; }}>
+      <section class="modal" role="dialog" aria-modal="true">
+        <div class="section-title"><div><p class="eyebrow">AUDIO</p><h2>Voice settings</h2></div><button class="secondary compact" on:click={() => showAudioModal = false}>Close</button></div>
+        <label class="setting"><input type="checkbox" bind:checked={forwardToLogger} on:change={applyAudioPreferences} />自分の音声をロガーにも送る</label>
+        <p class="hint">OFFでもピット内の通話には参加できます。接続先の全ノードへ設定を同期します。</p>
+        <label class="volume">Speaker volume ({Math.round(volume * 100)}%)<input type="range" min="0" max="2" step="0.05" value={volume} on:input={(event) => setVolume(Number((event.currentTarget as HTMLInputElement).value))} /></label>
+        <label class="volume">受信Opusビットレート（希望）<select bind:value={receiveBitrate} on:change={applyAudioPreferences}>{#each RECEIVE_BITRATES as bitrate}<option value={bitrate}>{bitrate / 1000} kbps</option>{/each}</select></label>
+        <label class="volume">受信Opusパケット長（希望）<select bind:value={receiveFrameMs} on:change={applyAudioPreferences}>{#each RECEIVE_FRAME_MS as frameMs}<option value={frameMs}>{frameMs} ms</option>{/each}</select></label>
+        <p class="hint">受信音質はサーバーへの希望値です。実際のビットレート・パケット長は接続先サーバーの再エンコード処理に依存します。</p>
+        <label class="volume">Microphone<select class="device-select" bind:value={selectedInputDevice} on:change={changeInputDevice}><option value="">Default microphone</option>{#each inputDevices as device}<option value={device.deviceId}>{device.label || `Microphone ${device.deviceId.slice(0, 8)}`}</option>{/each}</select></label>
+        <label class="volume">Mic volume ({Math.round(micVolume * 100)}%)<input type="range" min="0" max="2" step="0.05" value={micVolume} on:input={(event) => setMicVolume(Number((event.currentTarget as HTMLInputElement).value))} /></label>
+        <label class="volume">Mic boost ({micBoost.toFixed(1)}×)<input type="range" min="1" max="4" step="0.25" value={micBoost} on:input={(event) => setMicBoost(Number((event.currentTarget as HTMLInputElement).value))} /></label>
+        <label class="volume">送信Opus sample rate<select bind:value={opusSampleRate} on:change={applyAudioEncoderSettings}>{#each OPUS_SAMPLE_RATES as rate}<option value={rate}>{rate / 1000} kHz</option>{/each}</select></label>
+        <label class="volume">送信Opus frame duration<select bind:value={opusFrameMs} on:change={applyAudioEncoderSettings}>{#each OPUS_FRAME_MS as frameMs}<option value={frameMs}>{frameMs} ms</option>{/each}</select></label>
+        <label class="volume">送信Opus bitrate<select bind:value={opusBitrate} on:change={applyAudioEncoderSettings}>{#each RECEIVE_BITRATES as bitrate}<option value={bitrate}>{bitrate / 1000} kbps</option>{/each}</select></label>
+        <label class="volume">Speaker output{#if outputSelectionSupported}<select bind:value={selectedOutputDevice} on:change={selectOutputDevice}><option value="">Default speaker</option>{#each outputDevices as device}<option value={device.deviceId}>{device.label || `Speaker ${device.deviceId.slice(0, 8)}`}</option>{/each}</select>{:else}<select disabled><option>Switching unsupported</option></select>{/if}</label>
+        <p class="hint">送信設定はWebCodecsのOpusエンコーダーに適用します。受信はOpusデコーダーで再生します。</p>
+      </section>
+    </div>
+  {/if}
 </main>
 
 <style>
@@ -851,8 +1173,13 @@
   .header-actions, .map-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; } .room-subtitle { color: #8b949e; margin-top: 4px; font-size: 13px; }
   .grid { display: grid; grid-template-columns: 1.3fr 1fr; gap: 16px; } .ptt-card { min-height: 260px; display: grid; grid-template-columns: 1fr 190px; gap: 20px; align-items: center; } .ptt { width: 180px; height: 180px; border-radius: 50%; background: #21262d; border: 5px solid #30363d; } .ptt.active { background: #da3633; border-color: #ff7b72; transform: scale(.98); } .ptt-card small { grid-column: 1 / -1; color: #8b949e; }
   .participants { list-style: none; padding: 0; margin: 18px 0 0; display: grid; gap: 8px; color: #58a6ff; } .participants .me { font-weight: 800; } .muted { color: #8b949e; margin-top: 14px; } .volume { margin-top: 20px; } .hint { color: #8b949e; font-size: 11px; line-height: 1.5; margin-top: 14px; } .section-title > span { color: #8b949e; font-size: 12px; } .events { display: grid; gap: 10px; margin-top: 16px; } .events article { border: 1px solid #30363d; border-radius: 10px; padding: 12px; } .events time { color: #8b949e; font-size: 11px; margin-left: 10px; } pre { overflow: auto; margin: 10px 0 0; color: #c9d1d9; font-size: 11px; }
+  .chart-controls { display: flex; align-items: end; gap: 10px; flex-wrap: wrap; margin-top: 14px; } .chart-controls label { min-width: 170px; max-width: 320px; } .chart-controls button { flex-shrink: 0; }
+  .metric-picker { margin-top: 14px; } .metric-picker > label { max-width: 380px; } .metric-options { display: flex; gap: 7px; flex-wrap: wrap; max-height: 145px; overflow: auto; margin-top: 10px; } .metric-option { display: flex; flex: 0 1 auto; align-items: center; gap: 6px; max-width: 100%; padding: 6px 9px; border: 1px solid #30363d; border-radius: 8px; overflow-wrap: anywhere; } .metric-option input { width: auto; }
+  .charts { display: grid; grid-template-columns: repeat(auto-fit, minmax(310px, 1fr)); gap: 10px; margin-top: 16px; } .chart { border: 1px solid #30363d; border-radius: 10px; padding: 12px; min-width: 0; } .chart .section-title { align-items: start; } .chart strong { overflow-wrap: anywhere; font-size: 13px; } .chart svg { width: 100%; height: 150px; margin-top: 8px; color: #58a6ff; background: #0d1117; border-radius: 6px; } .chart-axis { display: flex; justify-content: space-between; gap: 10px; color: #8b949e; font-size: 10px; } .chart-values { margin-top: 8px; font-size: 11px; color: #8b949e; }
   .map-card { overflow: hidden; } .map { height: min(58vh, 520px); min-height: 320px; border-radius: 12px; overflow: hidden; margin-top: 14px; background: #0d1117; } .modal-backdrop { position: fixed; inset: 0; z-index: 2000; background: rgb(0 0 0 / 65%); display: grid; place-items: center; padding: 18px; } .modal { width: min(560px, 100%); max-height: 90vh; overflow: auto; background: #161b22; border: 1px solid #30363d; border-radius: 16px; padding: 20px; box-shadow: 0 20px 60px rgb(0 0 0 / 40%); } .modal > label { margin-top: 14px; }
+  @media (max-width: 700px) { main { width: min(100% - 20px, 960px); padding-top: 16px; } .grid, .ptt-card { grid-template-columns: 1fr; } .ptt { justify-self: center; } .row { flex-wrap: wrap; } .header-actions { justify-content: flex-end; } .map { min-height: 300px; } }
   .map.map-hidden { display: none; } .plot-list { margin-top: 16px; } .plot-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 9px 0; border-bottom: 1px solid #30363d; font-size: 13px; } .plot-row small { color: #8b949e; }
   .telemetry-count { color: #8b949e; font-size: 12px; }
   @media (max-width: 700px) { main { width: min(100% - 20px, 960px); padding-top: 16px; } .grid, .ptt-card { grid-template-columns: 1fr; } .ptt { justify-self: center; } .row { flex-wrap: wrap; } .row label { min-width: 100%; } .header-actions { justify-content: flex-end; } .map { min-height: 300px; } }
+
 </style>

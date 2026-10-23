@@ -21,7 +21,9 @@ const BROWSER_FRAME: usize = 960; // 60 ms
 #[tokio::main]
 async fn main() -> Result<()> {
     let mut args = env::args().skip(1);
-    let base = args.next().unwrap_or_else(|| "http://127.0.0.1:3000".into());
+    let base = args
+        .next()
+        .unwrap_or_else(|| "http://127.0.0.1:3000".into());
     let room = args.next().unwrap_or_else(|| "mix-test".into());
     let seconds: u64 = args.next().as_deref().unwrap_or("5").parse()?;
     let key = args.next().unwrap_or_default();
@@ -57,7 +59,9 @@ async fn main() -> Result<()> {
         }
     }
     browser
-        .send(Message::Text(format!("40{ns},{}", json!({"token": key})).into()))
+        .send(Message::Text(
+            format!("40{ns},{}", json!({"token": key})).into(),
+        ))
         .await?;
     // Wait for the server's `hello` event, not just the namespace CONNECT ack:
     // the ack can arrive before the server has registered the participant, and
@@ -75,7 +79,9 @@ async fn main() -> Result<()> {
         }
     }
     browser
-        .send(Message::Text(format!("42{ns},{}", json!(["audio.ptt", {"active": true}])).into()))
+        .send(Message::Text(
+            format!("42{ns},{}", json!(["audio.ptt", {"active": true}])).into(),
+        ))
         .await?;
     sleep(Duration::from_millis(300)).await;
 
@@ -84,7 +90,12 @@ async fn main() -> Result<()> {
         let mut pcm = [0_i16; 960];
         let (mut packets, mut bytes, mut samples, mut energy) = (0_usize, 0_usize, 0_usize, 0_f64);
         let deadline = Instant::now() + Duration::from_secs(seconds + 2);
-        while let Ok(Some(Ok(message))) = timeout(deadline.saturating_duration_since(Instant::now()), logger.next()).await {
+        while let Ok(Some(Ok(message))) = timeout(
+            deadline.saturating_duration_since(Instant::now()),
+            logger.next(),
+        )
+        .await
+        {
             if let Message::Binary(packet) = message {
                 packets += 1;
                 bytes += packet.len();
@@ -93,7 +104,12 @@ async fn main() -> Result<()> {
                 energy += pcm[..n].iter().map(|&s| f64::from(s).powi(2)).sum::<f64>();
             }
         }
-        (packets, bytes, samples, (energy / samples.max(1) as f64).sqrt())
+        (
+            packets,
+            bytes,
+            samples,
+            (energy / samples.max(1) as f64).sqrt(),
+        )
     });
 
     let mut encoder = Encoder::new(BROWSER_RATE, Channels::Mono, Application::Voip)?;
@@ -111,13 +127,21 @@ async fn main() -> Result<()> {
         let size = encoder.encode(&pcm, &mut out)?;
         browser
             .send(Message::Text(
-                format!("451-{ns},{}", json!(["audio.packet", {"_placeholder": true, "num": 0}])).into(),
+                format!(
+                    "451-{ns},{}",
+                    json!(["audio.packet", {"_placeholder": true, "num": 0}])
+                )
+                .into(),
             ))
             .await?;
-        browser.send(Message::Binary(out[..size].to_vec().into())).await?;
+        browser
+            .send(Message::Binary(out[..size].to_vec().into()))
+            .await?;
         sent += 1;
         // Answer Engine.IO pings so the browser socket stays up.
-        while let Ok(Some(Ok(Message::Text(text)))) = timeout(Duration::from_millis(1), browser.next()).await {
+        while let Ok(Some(Ok(Message::Text(text)))) =
+            timeout(Duration::from_millis(1), browser.next()).await
+        {
             if text == "2" {
                 browser.send(Message::Text("3".into())).await?;
             }
@@ -125,7 +149,9 @@ async fn main() -> Result<()> {
         sleep(Duration::from_millis(60)).await;
     }
     browser
-        .send(Message::Text(format!("42{ns},{}", json!(["audio.ptt", {"active": false}])).into()))
+        .send(Message::Text(
+            format!("42{ns},{}", json!(["audio.ptt", {"active": false}])).into(),
+        ))
         .await?;
 
     let (packets, bytes, samples, rms) = receiver.await?;

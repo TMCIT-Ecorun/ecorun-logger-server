@@ -76,7 +76,7 @@ pnpm install
 pnpm dev
 ```
 
-Vite の開発サーバが表示するURLを開き、画面上の **WebSocket endpoint** に Rust サーバの `ws://<server>:3000/ws/audio/{room_id}` を指定します。Web UI単体では、Rust側の静的ファイル配信は使いません。
+Vite の開発サーバが表示するURLを開き、画面上の **Server URL** に Rust サーバの `http://<server>:3000` を指定します。Web UIは Socket.IO の `/socket.io/` endpointを使用します。Web UI単体では、Rust側の静的ファイル配信は使いません。
 
 ### ブラウザ/PWA
 
@@ -121,7 +121,7 @@ cargo run -- admin
 接続直後、サーバは次の順で text message を送ります。
 
 1. `hello`: `protocol: 2` と `session_id`
-2. `audio.config`: `8 kHz / mono / 60 ms`
+2. `audio.config`: `8 kHz / mono / 60 ms`（初期値。`hello` で120ms受信を宣言したloggerには、続けて120ms版を通知）
 3. `room.state`: 初期roomの参加者一覧
 
 `hello` の後は、クライアントから `hello` を送り直して音声能力・役割などを通知できます。
@@ -139,9 +139,9 @@ cargo run -- admin
 
 `hello.audio_formats` を省略した場合はサーバの音声形式を受信できるものとして扱います。空配列の場合は受信音声を無効にします。`role: "logger"` はロガーとして扱われ、logger同士の音声転送は行いません。`forward_to_logger: false` でもloggerへの音声転送を止められます。
 
-音声送信は `audio.ptt` が active、かつ `audio.mute` が false のときだけ有効です。binary message は Opus packetで、サーバは受信packetをデコードしてから8 kHz mono / 60 ms単位で再エンコードし、同じroomの対象クライアントへfan-outします。受信側ごとのqueueは3 packet（約180 ms）で、遅い受信者では古いpacketがdropされます。
+音声送信は `audio.ptt` が active、かつ `audio.mute` が false のときだけ有効です。binary message は Opus packetで、サーバは受信packetをデコードしてから8 kHz mono / 60 ms単位で再エンコードし、同じroomの対象クライアントへfan-outします。受信側ごとのqueueは3 packet（通常約180 ms、120ms混合音声では約360ms）で、遅い受信者では新しい音声packetもdropされます。
 
-`bitrate` は `4000..32000` bps を受け付けます。`audio_config` は現在 `sample_rate: 8000`, `channels: 1`, `frame_ms: 60` のみ対応します。`mixer` は受信してログに残しますが、サーバは個別Opus packetのfan-outを行い、音声mixingはしません。
+`bitrate` は `4000..32000` bps を受け付けます。`audio_config` は `sample_rate: 8000`, `channels: 1`, `frame_ms: 60` または `120` に対応します。`role: "logger"` と `audio_formats` に8 kHz mono / 120 msを含むhelloがあれば、ブラウザで同時に話している音声をサーバで1本にmixし、約6 kbps / 120 msのOpusとしてloggerへ送信します。無音時は送信しません。`mixer: "mix"` または `true` も受け付けますが、混合音声の選択条件はroleと受信可能形式です。120msを宣言しない既存クライアント向けの60ms経路も残します。
 
 音声は binary WebSocket message の 8 kHz mono Opus packet として送受信します。text message は JSON の制御イベントに使います。音声は同じ room の送信元以外へ fan-out され、遅い受信者には bounded queue により古いpacketをdropします。
 
@@ -169,7 +169,8 @@ Raw WebSocketのprotocol versionは **2**、Socket.IO namespaceのprotocol versi
 
 ### Audio routing
 
-raw WebSocketのloggerはhelloで `{"role":"logger"}` を指定できます。loggerは他のloggerから音声を受け取らず、room内の他ユーザーからの音声だけを受け取ります。`audio_formats: []` なら受信音声を無効にできます。`forward_to_logger: false` でもloggerへの音声転送を停止できます。`audio_config` は現在 `8 kHz / mono / 60 ms` に固定し、`bitrate` は `4000..32000` bps を受け付けます。`mixer` はクライアント指定値を受信してログに残すだけです。ミックスを受けたいときは、下の「ロガー向けミックス」の形式を `audio_formats` に入れます。
+raw WebSocketのloggerはhelloで `{"role":"logger","mixer":"mix","audio_formats":[{"sample_rate":8000,"channels":1,"frame_ms":120}]}` を指定できます。ブラウザ音声はサーバ側で1本にmixされ、約6 kbps / 120 msのOpusとして受信できます。`audio_formats: []` なら受信音声を無効にでき、`forward_to_logger: false` でも停止できます。以前の60ms個別fan-out経路も維持します。loggerからのテレメトリと音声送信は従来のRaw WebSocketです。
+
 
 ### Phase 4.1 実装
 
@@ -259,6 +260,47 @@ cargo run --bin audio_test_client -- ws://127.0.0.1:3000/ws/audio/main main 60
 
 ブラウザも同じroom（`main`）に接続して受信ログと音を確認してください。
 
+## 設定
+
+`.env.example` を参照してください。現在の環境変数は以下です。
+
+| 変数 | デフォルト | 用途 |
+| --- | --- | --- |
+| `ECORUN_BIND` | `0.0.0.0:3000` | HTTP/WebSocket待受アドレス |
+| `RUST_LOG` | `ecorun_logger_server=info` | ログレベル |
+| `ECORUN_SERVERS` | `[]` | Webクライアントが接続するLoggerノード一覧。JSON配列で `id` / `name` / `url` / `available` を指定 |
+| `ECORUN_TELEMETRY_DIR` | `./data` | ノードごとのtelemetry NDJSON保存先 |
+| `ECORUN_DB_PATH` | `ecorun.sqlite3` | Room認証・地図・telemetryのSQLite DB |
+| `ECORUN_PODIUM_ENDPOINT` | `telemetry.podium.live:8080` | Podium接続先 |
+| `ECORUN_PODIUM_SERIAL` | `C3PROTO01` | Podiumのデバイス識別子 |
+
+`ECORUN_SERVERS` の例:
+
+```json
+[
+  {"id":"logger-a","name":"Logger A","url":"https://logger-a.example/","available":true},
+  {"id":"logger-b","name":"Logger B","url":"https://logger-b.example/","available":true}
+]
+```
+
+## 現在の機能
+
+- Rust + Tokio + Axum の HTTP/WebSocket サーバ
+- `GET /healthz`
+- `GET /ws/audio/{room_id}`
+- 8 kHz mono / 60 ms Opus 音声のroom fan-outと、logger向け120ms/約6kbps混合音声
+- Socket.IO による複数Loggerノードへの同時接続と自動再接続
+- 外部Redisを使わず、各Webクライアントが全Loggerノードへ接続し、loggerが接続したノードを選ぶ冗長構成
+- Logger telemetry の受信、ノードごとのNDJSON記録、Socket.IOによるWeb GUI配信
+- Web GUIで数値telemetryを折れ線グラフ表示
+- Webクライアントごとの送信Opusビットレート設定（6〜32 kbps）
+- bounded queue による slow receiver 対策
+- room join / leave と participant 状態
+- SIGINT / SIGTERM による graceful shutdown
+- SvelteKit PWA（room UI / PTT / telemetry表示）
+- WebCodecs Opus のブラウザ送受信経路
+- `web/build` の Rust 静的配信
+
 ## 現在の状態と残作業
 
 Phase 2 の実機検証（SIM7070G / Tailscale）はまだ完了していません。Phase 3 のWeb/PWA実装は入っていますが、ブラウザの WebCodecs Opus を実機で確認する必要があります。
@@ -275,25 +317,87 @@ pnpm run build
 
 詳細な移行計画とPhaseごとの完了条件は [`PLAN.md`](./PLAN.md) を参照してください。
 
+### 冗長構成
+
+外部Redisなどの共有サービスを必須にせず、**同じroomへ参加するWebクライアントが設定済みの全LoggerノードへSocket.IOのWebSocket接続を張る**方式です。各ノードは自分に接続したクライアントへ音声とテレメトリを配信します。ブラウザはroomごとの `logger.status` に基づき、実際にloggerが接続しているノードから音声・位置情報を受信し、そのノードへマイク音声を送ります。選択中ノードが切断された場合は直ちに別ノードを選び、接続が維持されている場合は候補のlogger接続が3秒間安定してから切り替えます。マップの変更は両ノードへ書き込み、切断中だった予備にも再接続時に現行マップを送ります。
+
+**loggerは主サーバーと予備のうち1台の `/ws/audio/{room_id}` へ接続します。** `podium.meta` と `podium.samples` は受信ノードでPodiumへ中継され、meta名をキーとする `telemetry` に変換されてSQLiteとNDJSONに保存・配信されます。サーバー間で走行ログや音声を同期する仕組みはありません。logger側の主→予備→Podium直接という切り替えに合わせてブラウザが表示先を選びます。両方にloggerが接続しない場合はその状態を表示します。
+
+2台構成の例:
+
+```text
+Logger ──▶ 主サーバー ───▶ Podium
+  └ (障害時) ─▶ 予備サーバー ─▶ Podium
+Browser ──Socket.IO──▶ 主サーバー
+  └──────Socket.IO──▶ 予備サーバー
+         (loggerのいる方を選択)
+```
+
+例えば2台を別ホストで動かす場合、両方の `ECORUN_SERVERS` に**双方のHTTPS URLを含む同一JSON**を設定します。両方のSQLiteにroom `race` と**同じroom key**を設定してください。WebブラウザからはどちらのURLを最初に開いても全ノードへ接続します。`ECORUN_SERVERS` が空の場合は現在開いているノードのみ使います。Tailscale FunnelのHTTPS URL間はSocket.IOのWebSocketで直接接続します。
+
+ピットでは**主・予備の両URLをブックマーク**してください。主サーバーのページを開いたままならWebSocket接続を自動で切り替えられますが、主サーバー停止後のページ再読み込みではその主サーバーのHTML/JSを取得できません。予備のブックマークから開き直す必要があります。地図の描画途中・通話・現在の受信状況は切り替えで一度途切れる場合があります。走行ログは各ノード別に保存されるので、大会後に集約します。room keyはロガーのRaw WebSocket接続には現状使いません。
+
+Socket.IOの標準in-memory adapter自体はプロセス間でイベントを共有しません。そのため、ここではRedis adapterを有効にする設定を削除し、ブラウザの多重接続を冗長化の境界として使っています。Socket.IOは `socketioxide` と `socket.io-client` の組み合わせです。
+
+### 音声設定
+
+Webクライアントの送信Opusはサンプルレート、フレーム長、ビットレートをクライアントごとに設定できます。ブラウザ同士は個別Opusを配信し、logger向けだけサーバでmixして低ビットレートに再エンコードします。
+
+Logger/Pi向けの `/ws/audio/{room_id}` は既存互換経路として残り、8 kHz mono / 60 msと120 ms（loggerへの混合音声）を扱います。
+
+### Telemetry
+
+Loggerは次のSocket.IOイベントを対象roomのnamespaceで送信できます。
+
+```json
+{
+  "source": "ecologger",
+  "timestamp": "2026-10-19T01:20:00+09:00",
+  "data": {
+    "speed_kmh": 12.4,
+    "battery_v": 3.91,
+    "temperature_c": 27.2
+  }
+}
+```
+
+イベント名は `telemetry.ingest` です。サーバは受信時刻を付加して保存し、`telemetry` イベントとしてWebクライアントへ送ります。GUIは数値フィールドを自動検出して折れ線グラフと直近イベントを表示します。
+
+## Dev Container
+
+`.devcontainer/` にRustサーバとWebクライアントの開発環境を用意しています。Docker対応のVS Codeで「Reopen in Container」を実行すると、Rust、libopus、Node.js、pnpm 10.0.0をまとめて利用できます。
+
+コンテナ作成後は `web` の依存関係が自動でインストールされます。
+
+### サーバを起動
+
+```bash
+cd web
+pnpm build
+cd ..
+cargo run
+```
+
+サーバは `http://localhost:3000`、ヘルスチェックは `http://localhost:3000/healthz` です。`ECORUN_BIND` と `RUST_LOG` は `.env.example` を参考に設定できます。
+
+### Webを開発
+
+```bash
+cd web
+pnpm dev --host 0.0.0.0
+```
+
+Viteは `5173` 番ポートで動作します。詳細は `.devcontainer/README.md` を参照してください。
+
 
 ### Telemetry replication / browser failover
 
-On the main node set `ECORUN_SERVER_ID=main` and configure `ECORUN_SERVERS` as
-JSON, for example:
+すべてのノードで同じ `ECORUN_SERVERS` を設定し、`ECORUN_NODE_ID` は各ノードの `id` に合わせて一意に設定します。`ECORUN_CLUSTER_TOKEN` は全ノードで共通の24文字以上の秘密文字列です。room ID と Socket.IO room key も全ノードで一致させます。
 
 ```env
-ECORUN_SERVER_ID=main
+ECORUN_NODE_ID=main
+ECORUN_CLUSTER_TOKEN=replace-with-a-shared-secret-at-least-24-chars
 ECORUN_SERVERS=[{"id":"main","name":"Primary","url":"https://main.example.org","available":true},{"id":"backup","name":"Backup","url":"https://backup.example.org","available":true}]
 ```
 
-The main node connects **outbound** to each available peer using Socket.IO over
-WebSocket (`/socket.io/`, namespace `/{room_id}`). Each node needs the same room
-IDs and Socket.IO room keys, otherwise the peer rejects the connection. Set
-`ECORUN_SERVERS=[]` on receiving backup nodes to prevent additional replication.
-The `ECORUN_SERVER_ID` must match the local entry's `id` to exclude itself.
-Both nodes keep separate SQLite telemetry records. Live telemetry, Podium
-metadata, and full Podium sample batches are forwarded. Replication is
-best-effort: events during outages or full queues are dropped, and existing
-historical records are not synchronized. Replicated events are never forwarded
-again by the receiver. The browser normally uses one connection and races
-available alternative servers against reconnection when its connection fails.
+クラスタは Socket.IO の専用 namespace を使い、Redis なしで双方向にテレメトリ・地図・音声を同期します。Podium メタデータ・元のサンプル列・名前付きの計測値を各ノードの SQLite に保存します。接続断から復帰すると未受信テレメトリの履歴同期を試みます。`ECORUN_SERVERS=[]` に設定すると、そのノードはクラスタ同期に参加しません。
