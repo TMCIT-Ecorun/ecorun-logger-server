@@ -33,7 +33,7 @@ pub struct SocketState {
 }
 
 #[derive(Deserialize)]
-struct SocketAuth {
+struct ClusterAuth {
     #[serde(default)]
     token: String,
     #[serde(default)]
@@ -380,7 +380,7 @@ async fn on_root<A: Adapter>(socket: SocketRef<A>) {
 async fn on_cluster<A: Adapter>(
     socket: SocketRef<A>,
     State(state): State<SocketState>,
-    TryData(auth): TryData<SocketAuth>,
+    TryData(auth): TryData<ClusterAuth>,
 ) {
     let Ok(auth) = auth else {
         socket.disconnect().ok();
@@ -511,22 +511,12 @@ async fn on_cluster<A: Adapter>(
     );
 }
 
-async fn on_room<A: Adapter>(
-    socket: SocketRef<A>,
-    State(state): State<SocketState>,
-    TryData(auth): TryData<SocketAuth>,
-) {
+async fn on_room<A: Adapter>(socket: SocketRef<A>, State(state): State<SocketState>) {
     let room = socket.ns().trim_start_matches('/').to_owned();
-    let auth_token = auth.map(|value| value.token).unwrap_or_default();
-    let authenticated = state
-        .rooms
-        .authenticate(&room, &auth_token)
-        .unwrap_or(false);
     if room.is_empty()
         || room.len() > 64
         || room.contains('/')
         || !state.rooms.exists(&room).unwrap_or(false)
-        || !authenticated
     {
         socket.disconnect().ok();
         return;

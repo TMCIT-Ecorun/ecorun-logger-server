@@ -1,0 +1,50 @@
+name: Client access checks
+
+on:
+  pull_request:
+    branches: [master]
+  push:
+    branches: [fix/remove-client-token-auth]
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install native dependencies
+        run: sudo apt-get update && sudo apt-get install -y libopus-dev pkg-config cmake
+      - name: Check Rust formatting
+        run: cargo fmt --check
+      - name: Check Rust
+        if: ${{ !cancelled() }}
+        run: cargo check --locked
+      - name: Test Rust
+        if: ${{ !cancelled() }}
+        run: cargo test --locked
+      - name: Install Web UI dependencies
+        if: ${{ !cancelled() }}
+        run: npx --yes pnpm@10.0.0 --dir web install --frozen-lockfile
+      - name: Check Svelte and TypeScript syntax
+        if: ${{ !cancelled() }}
+        working-directory: web
+        run: |
+          node --check tests/client-access.mjs
+          node --input-type=module -e "import {readFileSync} from 'node:fs'; import {compile} from 'svelte/compiler'; compile(readFileSync('src/routes/+page.svelte', 'utf8'), {filename: 'src/routes/+page.svelte', generate: 'client'});"
+      - name: Build Web UI
+        if: ${{ !cancelled() }}
+        run: npm --prefix web run build
+      - name: Build server and verify client access
+        if: ${{ !cancelled() }}
+        run: |
+          cargo build --locked --bin ecorun-logger-server
+          node web/tests/client-access.mjs

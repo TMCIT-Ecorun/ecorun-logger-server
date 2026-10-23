@@ -174,7 +174,9 @@ raw WebSocketのloggerはhelloで `{"role":"logger","mixer":"mix","audio_formats
 
 ### Phase 4.1 実装
 
-ブラウザ/PWAのリアルタイム通信は `socketioxide` + `socket.io-client` を使用します。Redis adapterは使用せず、単一のサーバプロセス内でroom状態とイベントを共有します。クライアントは `/api/rooms` から事前定義されたroom一覧を取得し、入力されたroom keyを `/{room_id}` namespaceのSocket.IO auth payloadとして渡して接続します。room切替時はnamespace URLを変更して再接続します。切断時は自動再接続し、復帰後にroom状態とmap設定を再取得します。ロガー向け `/ws/audio/{room_id}` は従来のWebSocket互換経路として維持します。
+ブラウザ/PWAのリアルタイム通信は `socketioxide` + `socket.io-client` を使用します。Redis adapterは使用せず、単一のサーバプロセス内でroom状態とイベントを共有します。クライアントは `/api/rooms` から事前定義されたroom一覧を取得し、Room keyやauth payloadなしで `/{room_id}` namespaceに接続します。room切替時はnamespace URLを変更して再接続します。切断時は自動再接続し、復帰後にroom状態とmap設定を再取得します。ロガー向け `/ws/audio/{room_id}` は従来のWebSocket互換経路として維持します。
+
+地図API（`GET/PUT /api/rooms/{room_id}/map`）とテレメトリ履歴API（`GET /api/rooms/{room_id}/telemetry`）にもBearerトークンは不要です。roomの存在チェックと入力値検証は引き続き行います。既存DBと管理ツールとの互換性のためroom keyの保存項目は残しますが、ブラウザやHTTP APIのアクセス認証には使用しません。ノード間の `/_cluster` namespaceの `ECORUN_CLUSTER_TOKEN`、Discord Botの `ECORUN_DISCORD_BOT_TOKEN`、Podiumなど外部サービスの認証は従来どおり必要です。
 
 ### メトリクスのPodium中継（Phase 5の一部）
 

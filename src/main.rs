@@ -6,7 +6,7 @@ use axum::{
         ws::{Message, WebSocket, WebSocketUpgrade},
         Path, Query, State,
     },
-    http::{header, HeaderMap, HeaderValue, StatusCode},
+    http::{header, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::get,
     Router,
@@ -279,7 +279,7 @@ async fn serve_app<A: Adapter + DefinedAdapter>(
         }
     });
     // Dynamic room namespaces are created when a browser connects. Publish
-    // Raw WebSocket telemetry to their authenticated Socket.IO room members.
+    // Raw WebSocket telemetry to their Socket.IO room members.
     let mut telemetry_rx = state.telemetry_updates.subscribe();
     let telemetry_io = io.clone();
     tokio::spawn(async move {
@@ -309,7 +309,7 @@ async fn serve_app<A: Adapter + DefinedAdapter>(
             }
         }
     });
-    // Bridge logger microphone audio to authenticated browsers in this room.
+    // Bridge logger microphone audio to browsers in this room.
     let mut raw_audio_rx = state.raw_audio_updates.subscribe();
     let audio_io = io.clone();
     let audio_state = socket_state.clone();
@@ -333,7 +333,7 @@ async fn serve_app<A: Adapter + DefinedAdapter>(
             }
         }
     });
-    // Authenticated Socket.IO presence is a per-node signal. A connected
+    // Socket.IO presence is a per-node signal. A connected
     // browser can select the node that actually holds the logger session.
     let status_io = io.clone();
     let status_rooms = state.rooms.clone();
@@ -426,23 +426,10 @@ async fn room_list(State(state): State<AppState>) -> impl IntoResponse {
     }
 }
 
-fn request_authorized(headers: &HeaderMap, rooms: &RoomStore, room_id: &str) -> bool {
-    headers
-        .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .map(|key| rooms.authenticate(room_id, key).unwrap_or(false))
-        .unwrap_or(false)
-}
-
 async fn map_get(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Path(room_id): Path<String>,
 ) -> impl IntoResponse {
-    if !request_authorized(&headers, &state.rooms_config, &room_id) {
-        return StatusCode::UNAUTHORIZED.into_response();
-    }
     if !state.rooms_config.exists(&room_id).unwrap_or(false) {
         return (
             StatusCode::FORBIDDEN,
@@ -462,13 +449,9 @@ async fn map_get(
 
 async fn map_put(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Path(room_id): Path<String>,
     axum::Json(map): axum::Json<map::MapConfig>,
 ) -> impl IntoResponse {
-    if !request_authorized(&headers, &state.rooms_config, &room_id) {
-        return StatusCode::UNAUTHORIZED.into_response();
-    }
     if !state.rooms_config.exists(&room_id).unwrap_or(false) {
         return (
             StatusCode::FORBIDDEN,
@@ -508,13 +491,9 @@ async fn map_put(
 
 async fn telemetry_get(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Path(room_id): Path<String>,
     Query(query): Query<TelemetryQuery>,
 ) -> impl IntoResponse {
-    if !request_authorized(&headers, &state.rooms_config, &room_id) {
-        return StatusCode::UNAUTHORIZED.into_response();
-    }
     if !state.rooms_config.exists(&room_id).unwrap_or(false) {
         return (
             StatusCode::FORBIDDEN,

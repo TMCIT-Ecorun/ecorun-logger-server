@@ -94,13 +94,6 @@ impl RoomStore {
             .context("check room")
     }
 
-    pub fn authenticate(&self, id: &str, key: &str) -> anyhow::Result<bool> {
-        Ok(self
-            .get(id)?
-            .map(|room| room.socket_key == key)
-            .unwrap_or(false))
-    }
-
     pub fn create(
         &self,
         id: &str,
