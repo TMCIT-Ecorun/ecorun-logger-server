@@ -161,7 +161,6 @@
   let mediaSessionSupported = false;
   let showConnectionModal = false;
   let showAudioModal = false;
-  let socketToken = '';
   type Room = { id: string; name: string };
   let rooms: Room[] = [];
   type MapPlot = { id: string; kind: 'point' | 'line'; coordinates: [number, number][]; color: string; label?: string };
@@ -341,7 +340,7 @@
       for (const url of serverEndpoints().filter((url) => url !== activeEndpoint)) {
         const candidate = io(`${url}/${encodeURIComponent(roomId.trim() || 'main')}`, {
           path: '/socket.io/', transports: ['websocket', 'polling'],
-          auth: { token: socketToken }, reconnection: false, timeout: 5000
+          reconnection: false, timeout: 5000
         });
         failoverSockets.push(candidate);
         candidate.on('connect', () => {
@@ -450,7 +449,7 @@
       }
       const response = await fetch(`${target}/api/rooms/${encodeURIComponent(room)}/telemetry?${params}`, {
         cache: 'no-store',
-        headers: socketToken ? { authorization: `Bearer ${socketToken}` } : undefined
+        
       });
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       const events = await response.json();
@@ -514,7 +513,6 @@
           // Cross-origin standby hosts can be reached directly over WebSocket;
           // HTTP polling would additionally require CORS preflight handling.
           path: '/socket.io/', transports: ['websocket'],
-          auth: { token: socketToken },
           reconnection: true, reconnectionAttempts: Infinity,
           reconnectionDelay: 500, reconnectionDelayMax: 10000, randomizationFactor: 0.5,
         });
@@ -650,7 +648,7 @@
 
   async function loadMap() {
     try {
-      const response = await fetch(`/api/rooms/${encodeURIComponent(roomId.trim() || 'main')}/map`, { cache: 'no-store', headers: socketToken ? { authorization: `Bearer ${socketToken}` } : undefined });
+      const response = await fetch(`/api/rooms/${encodeURIComponent(roomId.trim() || 'main')}/map`, { cache: 'no-store' });
       if (response.ok) { mapConfig = await response.json(); renderMap(); }
     } catch (error) { console.warn('[map] failed to load map config', error); }
   }
@@ -670,7 +668,7 @@
       return;
     }
     try {
-      await fetch(`/api/rooms/${encodeURIComponent(roomId.trim() || 'main')}/map`, { method: 'PUT', headers: { 'content-type': 'application/json', ...(socketToken ? { authorization: `Bearer ${socketToken}` } : {}) }, body: JSON.stringify(mapConfig) });
+      await fetch(`/api/rooms/${encodeURIComponent(roomId.trim() || 'main')}/map`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify(mapConfig) });
     } catch (error) { console.warn('[map] failed to save map config', error); }
   }
 
@@ -1063,10 +1061,6 @@
       errorMessage = '存在しないroomには接続できません。';
       return;
     }
-    if (!socketToken.trim()) {
-      errorMessage = 'Room keyを入力してください。';
-      return;
-    }
     updateEndpoint();
     connect();
     void loadMap();
@@ -1140,7 +1134,7 @@
   {/if}</section>
 
 
-  {#if showConnectionModal}<div class="modal-backdrop" role="presentation" on:click={(event) => { if (event.currentTarget === event.target) showConnectionModal = false; }}><section class="modal" role="dialog" aria-modal="true"><div class="section-title"><div><p class="eyebrow">CONNECTION</p><h2>Room & server</h2></div><button class="secondary compact" on:click={() => showConnectionModal = false}>Close</button></div><label>Logger server<select bind:value={selectedServer} on:change={updateEndpoint}>{#each servers as server}<option value={server.id} disabled={!server.available}>{server.name} {server.available ? '' : '(unavailable)'}</option>{/each}</select></label><label>Server URL<input bind:value={endpoint} /></label><label>Room<select bind:value={roomId}>{#each rooms as room}<option value={room.id}>{room.name} ({room.id})</option>{/each}</select></label><label>Room key<input type="password" bind:value={socketToken} autocomplete="off" placeholder="TUIで発行したroom key" /></label><div class="row"><button on:click={joinRoom}>{status === 'connected' ? 'Switch room' : 'Connect'}</button>{#if status === 'connected' || status === 'reconnecting'}<button class="secondary" on:click={disconnect}>Disconnect</button>{/if}</div><label class="setting"><input type="checkbox" checked={preventSleep} on:change={(event) => setPreventSleep((event.currentTarget as HTMLInputElement).checked)} /> 接続中は画面スリープを防止する</label><label class="setting"><input type="checkbox" checked={shareLocation} on:change={(event) => setShareLocation((event.currentTarget as HTMLInputElement).checked)} /> 位置情報を1分ごとに送信する</label><p class="hint">{mediaSessionSupported ? 'Media Session API対応ブラウザです。' : 'Media Session APIは利用できません。'} 位置情報はブラウザの許可が必要です。</p></section></div>{/if}
+  {#if showConnectionModal}<div class="modal-backdrop" role="presentation" on:click={(event) => { if (event.currentTarget === event.target) showConnectionModal = false; }}><section class="modal" role="dialog" aria-modal="true"><div class="section-title"><div><p class="eyebrow">CONNECTION</p><h2>Room & server</h2></div><button class="secondary compact" on:click={() => showConnectionModal = false}>Close</button></div><label>Logger server<select bind:value={selectedServer} on:change={updateEndpoint}>{#each servers as server}<option value={server.id} disabled={!server.available}>{server.name} {server.available ? '' : '(unavailable)'}</option>{/each}</select></label><label>Server URL<input bind:value={endpoint} /></label><label>Room<select bind:value={roomId}>{#each rooms as room}<option value={room.id}>{room.name} ({room.id})</option>{/each}</select></label><div class="row"><button on:click={joinRoom}>{status === 'connected' ? 'Switch room' : 'Connect'}</button>{#if status === 'connected' || status === 'reconnecting'}<button class="secondary" on:click={disconnect}>Disconnect</button>{/if}</div><label class="setting"><input type="checkbox" checked={preventSleep} on:change={(event) => setPreventSleep((event.currentTarget as HTMLInputElement).checked)} /> 接続中は画面スリープを防止する</label><label class="setting"><input type="checkbox" checked={shareLocation} on:change={(event) => setShareLocation((event.currentTarget as HTMLInputElement).checked)} /> 位置情報を1分ごとに送信する</label><p class="hint">{mediaSessionSupported ? 'Media Session API対応ブラウザです。' : 'Media Session APIは利用できません。'} 位置情報はブラウザの許可が必要です。</p></section></div>{/if}
   {#if showAudioModal}
     <div class="modal-backdrop" role="presentation" on:click={(event) => { if (event.currentTarget === event.target) showAudioModal = false; }}>
       <section class="modal" role="dialog" aria-modal="true">
