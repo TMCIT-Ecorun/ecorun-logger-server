@@ -24,6 +24,7 @@ use tracing::{info, warn};
 mod admin;
 mod audio;
 mod config;
+mod discord_ha;
 mod discord_voice;
 mod map;
 mod mixer;
