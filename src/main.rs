@@ -36,6 +36,7 @@ mod socketio_api;
 #[cfg(test)]
 mod telemetry;
 mod telemetry_bridge;
+mod telemetry_files;
 
 use audio::{AudioCodec, OpusCodec};
 use config::RoomStore;

@@ -269,7 +269,7 @@ cargo run --bin audio_test_client -- ws://127.0.0.1:3000/ws/audio/main main 60
 | `ECORUN_BIND` | `0.0.0.0:3000` | HTTP/WebSocket待受アドレス |
 | `RUST_LOG` | `ecorun_logger_server=info` | ログレベル |
 | `ECORUN_SERVERS` | `[]` | Webクライアントが接続するLoggerノード一覧。JSON配列で `id` / `name` / `url` / `available` を指定 |
-| `ECORUN_TELEMETRY_DIR` | `./data` | ノードごとのtelemetry NDJSON保存先 |
+| `ECORUN_TELEMETRY_DIR` | `./data` | ノードごとのtelemetryファイルの保存先（`<dir>/<room>/<開始時刻>Z.jsonl`。空文字で保存しない） |
 | `ECORUN_DB_PATH` | `ecorun.sqlite3` | Room認証・地図・telemetryのSQLite DB |
 | `ECORUN_PODIUM_ENDPOINT` | `telemetry.podium.live:8080` | Podium接続先 |
 | `ECORUN_PODIUM_SERIAL` | `C3PROTO01` | Podiumのデバイス識別子 |
@@ -291,7 +291,7 @@ cargo run --bin audio_test_client -- ws://127.0.0.1:3000/ws/audio/main main 60
 - 8 kHz mono / 60 ms Opus 音声のroom fan-outと、logger向け120ms/約6kbps混合音声
 - Socket.IO による複数Loggerノードへの同時接続と自動再接続
 - 外部Redisを使わず、各Webクライアントが全Loggerノードへ接続し、loggerが接続したノードを選ぶ冗長構成
-- Logger telemetry の受信、ノードごとのNDJSON記録、Socket.IOによるWeb GUI配信
+- Logger telemetry の受信、ノードごとのJSON Lines記録（roomごと・セッションごと）、Socket.IOによるWeb GUI配信
 - Web GUIで数値telemetryを折れ線グラフ表示
 - Webクライアントごとの送信Opusビットレート設定（6〜32 kbps）
 - bounded queue による slow receiver 対策
@@ -321,7 +321,7 @@ pnpm run build
 
 外部Redisなどの共有サービスを必須にせず、**同じroomへ参加するWebクライアントが設定済みの全LoggerノードへSocket.IOのWebSocket接続を張る**方式です。各ノードは自分に接続したクライアントへ音声とテレメトリを配信します。ブラウザはroomごとの `logger.status` に基づき、実際にloggerが接続しているノードから音声・位置情報を受信し、そのノードへマイク音声を送ります。選択中ノードが切断された場合は直ちに別ノードを選び、接続が維持されている場合は候補のlogger接続が3秒間安定してから切り替えます。マップの変更は両ノードへ書き込み、切断中だった予備にも再接続時に現行マップを送ります。
 
-**loggerは主サーバーと予備のうち1台の `/ws/audio/{room_id}` へ接続します。** `podium.meta` と `podium.samples` は受信ノードでPodiumへ中継され、meta名をキーとする `telemetry` に変換されてSQLiteとNDJSONに保存・配信されます。サーバー間で走行ログや音声を同期する仕組みはありません。logger側の主→予備→Podium直接という切り替えに合わせてブラウザが表示先を選びます。両方にloggerが接続しない場合はその状態を表示します。
+**loggerは主サーバーと予備のうち1台の `/ws/audio/{room_id}` へ接続します。** `podium.meta` と `podium.samples` は受信ノードでPodiumへ中継され、meta名をキーとする `telemetry` に変換されてSQLiteに保存・配信されます。ロガーが送った行そのものはJSON Linesファイルにも残ります（下の「Telemetryファイル」）。サーバー間で走行ログや音声を同期する仕組みはありません。logger側の主→予備→Podium直接という切り替えに合わせてブラウザが表示先を選びます。両方にloggerが接続しない場合はその状態を表示します。
 
 2台構成の例:
 
@@ -344,6 +344,18 @@ Socket.IOの標準in-memory adapter自体はプロセス間でイベントを共
 Webクライアントの送信Opusはサンプルレート、フレーム長、ビットレートをクライアントごとに設定できます。ブラウザ同士は個別Opusを配信し、logger向けだけサーバでmixして低ビットレートに再エンコードします。
 
 Logger/Pi向けの `/ws/audio/{room_id}` は既存互換経路として残り、8 kHz mono / 60 msと120 ms（loggerへの混合音声）を扱います。
+
+### Telemetryファイル
+
+各ノードは、ロガーの走行をroomごと・セッションごとのJSON Linesに残します（DBを開かずに読み返したり、追記を追いかけてGrafana等へ流したりするため）。`podium.meta` を受けるたびに新しいファイルになります。
+
+```text
+<ECORUN_TELEMETRY_DIR>/<room_id>/<YYYYMMDD-HHMMSS>Z.jsonl
+{"recv_ms":1791077786762,"meta":[...]}
+{"recv_ms":1791077787262,"samples":[[...],[...]]}
+```
+
+`recv_ms` はロガーがつながっているノードでの受信時刻（Unix ms）で、複製先のノードでも同じ値になります。行はロガーが送ったまま（`meta` 順の値＋bitmask）です。そこから名前を付けた `podium` の行は重複になるので書きません。それ以外のtelemetry（Socket.IOの `telemetry.ingest` 等）はイベントごと `<room_id>/events.ndjson` に追記します。
 
 ### Telemetry
 
