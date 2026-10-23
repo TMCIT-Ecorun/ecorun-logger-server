@@ -64,6 +64,8 @@ struct AppState {
     telemetry_updates: broadcast::Sender<socketio_api::TelemetryEvent>,
     raw_audio_updates: broadcast::Sender<(String, String, u64, Vec<u8>)>,
     cluster: cluster::Cluster,
+    /// The loggers' `logger.config` answers, for the Discord bot's `/ecologger audio`.
+    logger_config: broadcast::Sender<(String, serde_json::Value)>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -185,6 +187,7 @@ async fn main() -> anyhow::Result<()> {
     let telemetry = Arc::new(socketio_api::TelemetryStore::new());
     let (telemetry_updates, _) = broadcast::channel(512);
     let (raw_audio_updates, _) = broadcast::channel(128);
+    let (logger_config, _) = broadcast::channel(16);
     let cluster = cluster::Cluster::from_env()?;
     let delivery = Arc::new(audio_delivery::AudioDelivery::new());
     let socket_state = socketio_api::SocketState::new(
@@ -200,9 +203,11 @@ async fn main() -> anyhow::Result<()> {
     let podium = Arc::new(PodiumHub::from_env(rooms.clone(), rooms_config.clone()));
     discord_voice::spawn(
         rooms_config.clone(),
+        rooms.clone(),
         mix.clone(),
         cluster.clone(),
         raw_audio_updates.clone(),
+        logger_config.clone(),
     );
     let (layer, io) = SocketIo::builder()
         .with_state(socket_state.clone())
@@ -217,6 +222,7 @@ async fn main() -> anyhow::Result<()> {
         raw_audio_updates,
         rooms,
         cluster,
+        logger_config,
     };
     let routes = Router::new()
         .route("/healthz", get(healthz))
@@ -802,6 +808,9 @@ async fn handle_audio_socket(mut socket: WebSocket, state: AppState, initial_roo
                         }
                         Ok(ControlEvent::LoggerConfig { data }) => {
                             if let Some(room) = room_id.as_deref() {
+                                if is_logger {
+                                    let _ = state.logger_config.send((room.to_owned(), data.clone()));
+                                }
                                 let event = serde_json::json!({"type":"logger.config","session_id":session_id,"data":data}).to_string();
                                 if is_logger {
                                     state.rooms.broadcast_control_to_non_loggers(room, event).await;

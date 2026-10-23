@@ -437,3 +437,35 @@ Discord speech to Logger/Pi and web participants and plays Logger and web
 speech in Discord; it also forwards voice events across the existing cluster.
 No Python environment or companion process is required. Runtime verification
 requires a real bot token and voice channel.
+
+Room audio reaches Discord as a mix: each talker has its own decoder, so two
+people talking at once are heard together. Discord speech is low-passed at
+3.4 kHz before it is decimated to 8 kHz (plain averaging folds everything
+above 4 kHz back into the voice band as noise).
+
+### `/ecologger` slash command
+
+The bot registers one guild command on start (it shows up at once). Replies are
+visible only to the caller. The standby bot of a dual-bot pair does not register
+it, so the pit sees one `/ecologger`.
+
+- `/ecologger join [channel] [room]` binds the room to a voice channel (the
+  caller's channel when omitted) and joins it. `room` defaults to the room this
+  guild is bound to, else `ECORUN_DISCORD_DEFAULT_ROOM`. Other rooms bound in the
+  same guild are unbound, since a bot can be in one voice channel per guild.
+  The binding is the room's `discord_channel_id`, so it survives a restart.
+- `/ecologger leave` unbinds this guild's room (the bot stays out after a restart).
+- `/ecologger status` shows the room, the voice channel, how many loggers are
+  connected to this node, and whether Discord audio is being relayed now.
+- `/ecologger audio [level] [max_gain] [lowcut] [bitrate] [volume]` reads or
+  changes the logger's voice settings (driver's voice level, gain limit, low-cut,
+  bitrate, earphone volume) through `logger.config` and shows the logger's
+  answer. On LTE the answer takes up to several seconds.
+
+### `logger.config`
+
+A pass-through for settings on the logger in a room, over `/ws/audio/{room_id}`:
+`{"type":"logger.config","data":{...}}` from a non-logger goes to the room's
+loggers only, and a logger's (its answer with the values it now uses) goes to
+everyone else in the room. Nothing is stored. Only loggers connected to the same
+node receive it.
