@@ -9,7 +9,7 @@ use socketioxide::{
     SocketIo,
 };
 use socketioxide_core::adapter::DefinedAdapter;
-use tokio::sync::RwLock;
+use tokio::sync::{broadcast, RwLock};
 use tracing::{info, warn};
 
 use crate::config::RoomStore;
@@ -24,6 +24,7 @@ pub struct SocketState {
     pub rooms: Arc<RoomStore>,
     mix: Arc<MixHub>,
     replication: Replicator,
+    discord_audio: broadcast::Sender<crate::discord_voice::Packet>,
 }
 
 #[derive(Deserialize)]
@@ -64,6 +65,7 @@ impl SocketState {
         rooms: Arc<RoomStore>,
         mix: Arc<MixHub>,
         replication: Replicator,
+        discord_audio: broadcast::Sender<crate::discord_voice::Packet>,
     ) -> Self {
         Self {
             participants: Arc::new(RwLock::new(HashMap::new())),
@@ -71,6 +73,7 @@ impl SocketState {
             rooms,
             mix,
             replication,
+            discord_audio,
         }
     }
 }
@@ -220,7 +223,8 @@ async fn on_room<A: Adapter>(
         let id = socket.id.to_string();
         let allowed = state.participants.read().await.get(&room).and_then(|members| members.get(&id)).map(|p| !p.muted && p.ptt).unwrap_or(false);
         if allowed {
-            state.mix.push(&room, SourceId::Socket(id), &packet);
+            state.mix.push(&room, SourceId::Socket(id.clone()), &packet);
+            let _ = state.discord_audio.send((room.clone(), format!("socket:{id}"), 0, packet.to_vec()));
             if let Err(error) = socket.to(room).emit("audio.packet", &packet).await {
                 warn!(%error, "failed to fan out audio packet");
             }

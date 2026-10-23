@@ -173,6 +173,17 @@ impl RoomManager {
             }
         }
     }
+    /// Forward audio originating outside a WebSocket session (e.g. Discord).
+    pub async fn broadcast_external_audio(&self, room_id: &str, packet: Vec<u8>) {
+        let rooms = self.rooms.read().await;
+        if let Some(room) = rooms.get(room_id) {
+            for participant in room.values() {
+                if participant.receive_audio {
+                    let _ = participant.audio_tx.try_send(packet.clone());
+                }
+            }
+        }
+    }
     pub async fn broadcast_control_to_non_loggers(&self, room_id: &str, event: String) {
         let rooms = self.rooms.read().await;
         let Some(room) = rooms.get(room_id) else {

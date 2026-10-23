@@ -16,7 +16,7 @@ use socketioxide::{adapter::Adapter, layer::SocketIoLayer, SocketIo};
 use socketioxide_core::adapter::DefinedAdapter;
 use tokio::{
     net::TcpListener,
-    sync::mpsc,
+    sync::{broadcast, mpsc},
     time::{interval, timeout, MissedTickBehavior},
 };
 use tracing::{info, warn};
@@ -24,6 +24,7 @@ use tracing::{info, warn};
 mod admin;
 mod audio;
 mod config;
+mod discord_voice;
 mod map;
 mod mixer;
 mod podium;
@@ -56,6 +57,7 @@ struct AppState {
     map: Arc<map::MapStore>,
     io: SocketIo,
     replication: replication::Replicator,
+    discord_audio: broadcast::Sender<discord_voice::Packet>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -173,14 +175,23 @@ async fn main() -> anyhow::Result<()> {
     let mix = Arc::new(MixHub::from_env());
     mix.clone().spawn();
     let replication = replication::Replicator::start(&rooms_config);
+    let (discord_audio, _) = broadcast::channel(256);
     let socket_state = socketio_api::SocketState::new(
         map.clone(),
         rooms_config.clone(),
         mix.clone(),
         replication.clone(),
+        discord_audio.clone(),
     );
     let podium = Arc::new(PodiumHub::from_env(rooms.clone(), rooms_config.clone()));
     let (layer, io) = SocketIo::builder().with_state(socket_state).build_layer();
+    discord_voice::spawn(
+        rooms_config.clone(),
+        mix.clone(),
+        io.clone(),
+        rooms.clone(),
+        discord_audio.clone(),
+    );
     let state = AppState {
         rooms_config,
         mix,
@@ -189,6 +200,7 @@ async fn main() -> anyhow::Result<()> {
         rooms,
         io: io.clone(),
         replication: replication.clone(),
+        discord_audio,
     };
     let routes = Router::new()
         .route("/healthz", get(healthz))
@@ -570,6 +582,7 @@ async fn handle_audio_socket(mut socket: WebSocket, state: AppState, initial_roo
                             warn!(%error, room, "failed to forward logger audio to Socket.IO");
                         }
                     }
+                    let _ = state.discord_audio.send((room.to_owned(), format!("logger:{session_id}"), 0, packet.clone()));
                     state.rooms.broadcast_audio(room, session_id, packet).await;
                 }
             },
