@@ -45,8 +45,10 @@ pub fn spawn(
     if token.trim().is_empty() {
         return;
     }
+    let audio_active = crate::discord_ha::start();
     tokio::spawn(async move {
         let handler = Bot {
+            audio_active,
             started: AtomicBool::new(false),
             rooms,
             mix,
@@ -76,6 +78,7 @@ pub fn spawn(
 
 struct Bot {
     started: AtomicBool,
+    audio_active: Arc<AtomicBool>,
     rooms: Arc<RoomStore>,
     mix: Arc<MixHub>,
     io: SocketIo,
@@ -89,12 +92,13 @@ impl EventHandler for Bot {
         if self.started.swap(true, Ordering::AcqRel) {
             return;
         }
+        let audio_active = self.audio_active.clone();
         let rooms = self.rooms.clone();
         let mix = self.mix.clone();
         let io = self.io.clone();
         let peers = self.peers.clone();
         let audio = self.audio.clone();
-        tokio::spawn(async move { watch(ctx, rooms, mix, io, peers, audio).await });
+        tokio::spawn(async move { watch(ctx, audio_active, rooms, mix, io, peers, audio).await });
     }
 }
 
@@ -107,6 +111,7 @@ struct Active {
 
 async fn watch(
     ctx: Context,
+    audio_active: Arc<AtomicBool>,
     rooms: Arc<RoomStore>,
     mix: Arc<MixHub>,
     io: SocketIo,
@@ -118,10 +123,16 @@ async fn watch(
     };
     let mut active: HashMap<String, Active> = HashMap::new();
     let mut audio_rx = audio.subscribe();
+    let mut was_active = audio_active.load(Ordering::Acquire);
     let mut tick = tokio::time::interval(Duration::from_secs(5));
     loop {
         tokio::select! {
             _ = tick.tick() => {
+                let now_active = audio_active.load(Ordering::Acquire);
+                if was_active && !now_active {
+                    for a in active.values() { a.playback.lock().unwrap().clear(); }
+                }
+                was_active = now_active;
                 let desired = match rooms.list() { Ok(list) => list, Err(err) => { warn!(%err, "Discord room scan failed"); continue } };
                 let configured: HashMap<String,u64> = desired.into_iter().filter_map(|r| r.discord_channel_id.and_then(|v| v.parse().ok()).map(|id| (r.id,id))).collect();
                 let stale: Vec<_> = active.iter().filter(|(room, a)| configured.get(*room) != Some(&a.channel)).map(|(room, _)| room.clone()).collect();
@@ -143,6 +154,7 @@ async fn watch(
                             let reader = Playback(playback.clone());
                             let mut guard = call.lock().await;
                             guard.add_global_event(Event::Core(CoreEvent::VoiceTick), VoiceReceive {
+                                audio_active: audio_active.clone(),
                                 room: room.clone(), mix: mix.clone(), io: io.clone(), peers: peers.clone(), audio: audio.clone(),
                                 sources: Mutex::new(HashMap::new()),
                             });
@@ -157,7 +169,7 @@ async fn watch(
             }
             result = audio_rx.recv() => {
                 if let Ok((room, source, _, packet)) = result {
-                    if !source.starts_with("discord:") { if let Some(a) = active.get_mut(&room) { feed(&a.playback, &mut a.decoder, &packet); } }
+                    if audio_active.load(Ordering::Acquire) && !source.starts_with("discord:") { if let Some(a) = active.get_mut(&room) { feed(&a.playback, &mut a.decoder, &packet); } }
                 }
             }
         }
@@ -212,6 +224,7 @@ fn feed(queue: &Arc<Mutex<VecDeque<u8>>>, codec: &mut OpusCodec, packet: &[u8]) 
 }
 
 struct VoiceReceive {
+    audio_active: Arc<AtomicBool>,
     room: String,
     mix: Arc<MixHub>,
     io: SocketIo,
@@ -222,6 +235,10 @@ struct VoiceReceive {
 #[async_trait]
 impl VoiceHandler for VoiceReceive {
     async fn act(&self, event: &EventContext<'_>) -> Option<Event> {
+        if !self.audio_active.load(Ordering::Acquire) {
+            self.sources.lock().unwrap().clear();
+            return None;
+        }
         if let EventContext::VoiceTick(tick) = event {
             let mut emitted = Vec::new();
             {
