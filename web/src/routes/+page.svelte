@@ -448,8 +448,7 @@
         if (customRangeEnd) params.set('until', new Date(customRangeEnd).toISOString());
       }
       const response = await fetch(`${target}/api/rooms/${encodeURIComponent(room)}/telemetry?${params}`, {
-        cache: 'no-store',
-        
+        cache: 'no-store'
       });
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       const events = await response.json();
