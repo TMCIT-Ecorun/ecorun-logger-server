@@ -12,8 +12,18 @@ use anyhow::{anyhow, Context};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
+use tokio::time::{interval, timeout, Instant, MissedTickBehavior};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{info, warn};
+
+// Reconnect if a TCP connection stays open but no Engine.IO heartbeat arrives.
+const PEER_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+const PEER_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
+const PEER_WATCHDOG_INTERVAL: Duration = Duration::from_secs(15);
+
+fn peer_is_idle(last_received: Instant, now: Instant) -> bool {
+    now.duration_since(last_received) >= PEER_IDLE_TIMEOUT
+}
 
 use crate::{
     map::{MapConfig, MapStore},
@@ -197,17 +207,27 @@ impl Cluster {
             "{}/socket.io/?EIO=4&transport=websocket",
             ws.trim_end_matches('/')
         );
-        let (mut socket, _) = connect_async(&url)
+        let (mut socket, _) = timeout(PEER_CONNECT_TIMEOUT, connect_async(&url))
             .await
+            .context("cluster peer websocket connect timed out")?
             .context("open Socket.IO websocket")?;
         let mut outgoing = self.outbound.subscribe();
         let sends_live = self.node_id() < peer_id;
         let mut joined = false;
+        let mut last_received = Instant::now();
+        let mut watchdog = interval(PEER_WATCHDOG_INTERVAL);
+        watchdog.set_missed_tick_behavior(MissedTickBehavior::Delay);
         loop {
             tokio::select! {
+                _ = watchdog.tick() => {
+                    if peer_is_idle(last_received, Instant::now()) {
+                        return Err(anyhow!("cluster peer idle for {}s (no WebSocket frames received)", PEER_IDLE_TIMEOUT.as_secs()));
+                    }
+                }
                 message = socket.next() => {
                     let Some(message) = message else { break; };
                     let message = message.context("peer websocket closed")?;
+                    last_received = Instant::now();
                     let Message::Text(text) = message else { continue; };
                     let text = text.as_str();
                     if text.starts_with('0') {
@@ -325,6 +345,15 @@ where
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn idle_watchdog_detects_silence() {
+        let start = Instant::now();
+        assert!(!peer_is_idle(start, start + Duration::from_secs(89)));
+        assert!(peer_is_idle(start, start + Duration::from_secs(90)));
+    }
+
     #[test]
     fn peer_event_prefix_is_correct() {
         let payload = "42/_cluster,[\"cluster.event\",{}]";
